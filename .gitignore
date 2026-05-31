@@ -1,0 +1,4 @@
+MRM-Portal-main*/
+**/v4_env_vars.json
+.env
+*.env.local
