@@ -39,6 +39,22 @@ async function jget(path, { params, signal } = {}) {
   return r.json();
 }
 
+async function jpost(path, body, { signal } = {}) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { ...HEADERS, 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!r.ok) {
+    let text = '';
+    try { text = (await r.text()).slice(0, 400); } catch {}
+    throw new ApiError(`${r.status} ${r.statusText} on ${path}${text ? ` — ${text}` : ''}`, r.status);
+  }
+  return r.json();
+}
+
 function unwrapList(data, keys = ['data', 'items', 'bundles', 'results', 'projects']) {
   if (data == null) return [];
   if (Array.isArray(data)) return data;
@@ -90,14 +106,14 @@ export async function fetchAllBundles() {
   }
 }
 
-export async function fetchResults(bundleId, scope = 'latest') {
-  // Note: the governance API param is `bundleID` (capital ID), per swagger_1.json.
-  // Using `bundleId` returns 400.
-  const path = scope === 'latest'
-    ? '/api/governance/v1/results/latest'
-    : '/api/governance/v1/results';
-  const data = await jget(path, { params: { bundleID: bundleId } });
-  return unwrapList(data, ['results', 'data', 'items']);
+// Returns the fully-computed policy view for a bundle: bundle + policy
+// (with stages → approvals.evidence.artifacts and evidenceSet.artifacts) + results.
+// This is the same call MRM Portal uses, and it lets us emit a row per *policy
+// question* — including unanswered ones — instead of only per recorded result.
+export async function fetchComputedPolicy(bundleId, policyId, policyVersionId) {
+  const body = { bundleId, policyId };
+  if (policyVersionId) body.policyVersionId = policyVersionId;
+  return jpost('/api/governance/v1/rpc/compute-policy', body);
 }
 
 // Promise pool: runs `worker(item, i)` for each input with at most `n` in flight,

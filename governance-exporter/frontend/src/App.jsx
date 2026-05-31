@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
-import { fetchProjects, fetchAllBundles, fetchResults, pool } from './api.js';
+import { fetchProjects, fetchAllBundles, fetchComputedPolicy, pool } from './api.js';
 import {
   COLUMN_GROUPS,
   ALL_COLUMNS,
@@ -24,6 +24,54 @@ const fmtNumber = (n) => (n ?? 0).toLocaleString();
 const isoStamp = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const fileStamp = () => new Date().toISOString().replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
+// A single bundle can have multiple policies attached (see bundle.policies[]).
+// Each one needs its own compute-policy call. Falls back to the bundle's
+// primary policyId for older payloads that only expose the legacy field.
+function bundlePolicyRefs(bundle) {
+  const list = Array.isArray(bundle.policies) ? bundle.policies : [];
+  const refs = list
+    .filter((p) => p && p.policyId)
+    .map((p) => ({ policyId: p.policyId, policyVersionId: p.policyVersionId }));
+  if (refs.length === 0 && bundle.policyId) {
+    refs.push({ policyId: bundle.policyId, policyVersionId: bundle.policyVersionId });
+  }
+  // De-dupe by policyId+versionId — bundle.policies can repeat the same policy.
+  const seen = new Set();
+  return refs.filter((r) => {
+    const k = `${r.policyId}::${r.policyVersionId || ''}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+// Fetch compute-policy for every policy attached to a bundle. 404s are tolerated
+// (treated as "policy not computable for this bundle" — empty payload). 403s
+// propagate so the caller can decide whether the whole bundle is denied.
+async function fetchAllComputedForBundle(bundle) {
+  const id = bundle.id || bundle._id;
+  const refs = bundlePolicyRefs(bundle);
+  if (refs.length === 0) return [];
+  const out = [];
+  let denials = 0;
+  for (const ref of refs) {
+    try {
+      out.push(await fetchComputedPolicy(id, ref.policyId, ref.policyVersionId));
+    } catch (e) {
+      if (e && e.status === 404) continue;
+      if (e && e.status === 403) { denials++; continue; }
+      throw e;
+    }
+  }
+  // If every policy 403'd we surface that — the bundle is effectively denied.
+  if (out.length === 0 && denials > 0) {
+    const err = new Error(`compute-policy 403 for all ${denials} policies on bundle ${id}`);
+    err.status = 403;
+    throw err;
+  }
+  return out;
+}
+
 export default function App() {
   // ── Server state ────────────────────────────────────────────────────────────
   const [projects, setProjects] = useState([]);
@@ -39,7 +87,7 @@ export default function App() {
   const [probing, setProbing] = useState(false);
   const [probeStats, setProbeStats] = useState({ done: 0, total: 0, accessible: 0, denied: 0 });
   const [accessibleIds, setAccessibleIds] = useState(() => new Set());
-  const probeCacheRef = useRef(new Map()); // bundleId -> results[] (scope=latest)
+  const probeCacheRef = useRef(new Map()); // bundleId -> computed-policy payload
 
   // ── User selections ────────────────────────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -107,23 +155,23 @@ export default function App() {
       CONCURRENCY,
       async (bundle) => {
         const id = bundle.id || bundle._id;
+        // Bundles with no attached policy contribute no rows but should still
+        // count as accessible (so the UI surfaces them).
+        if (bundlePolicyRefs(bundle).length === 0) {
+          probeCacheRef.current.set(id, []);
+          accessible.add(id);
+          if (!cancelled) setAccessibleIds(new Set(accessible));
+          return;
+        }
         try {
-          const results = await fetchResults(id, 'latest');
-          probeCacheRef.current.set(id, results);
+          const computedList = await fetchAllComputedForBundle(bundle);
+          probeCacheRef.current.set(id, computedList);
           accessible.add(id);
           // Stream updates: as soon as we learn a bundle is accessible, add it
           // so the project counts in the UI grow live.
           if (!cancelled) setAccessibleIds(new Set(accessible));
-          return results;
+          return computedList;
         } catch (e) {
-          // 403 = denied (per-project ACL). 404 = no results yet but user has
-          // access; we still want to surface those, so we treat them as accessible.
-          if (e && e.status === 404) {
-            probeCacheRef.current.set(id, []);
-            accessible.add(id);
-            if (!cancelled) setAccessibleIds(new Set(accessible));
-            return [];
-          }
           throw e;
         }
       },
@@ -267,13 +315,7 @@ export default function App() {
     const cols = ALL_COLUMNS.filter((c) => columns.has(c));
     const projectsById = new Map(projects.map((p) => [p.id, p]));
 
-    const csv = new CsvBuilder(cols, [
-      `governance-evidence export`,
-      `exported_at_utc=${exportedAt}`,
-      `scope=${scope}`,
-      `project_count=${exportableProjectCount}`,
-      `bundle_count=${exportable.length}`,
-    ]);
+    const csv = new CsvBuilder(cols);
     let rowCount = 0;
     let failedCount = 0;
 
@@ -282,15 +324,20 @@ export default function App() {
         const id = bundle.id || bundle._id;
         const ctx = bundleContext(bundle, projectsById);
         try {
-          // Reuse the probe cache for scope=latest. For scope=history we need
-          // a separate fetch since the probe only fetched latest answers.
-          let results;
-          if (scope === 'latest' && probeCacheRef.current.has(id)) {
-            results = probeCacheRef.current.get(id);
-          } else {
-            results = await fetchResults(id, scope);
+          // The probe already fetched compute-policy for every attached policy
+          // on this bundle. Re-use that cache. (compute-policy returns latest
+          // + historical results in one payload; scope filtering is client-side.)
+          let computedList = probeCacheRef.current.get(id);
+          if (!computedList) {
+            computedList = await fetchAllComputedForBundle(bundle);
           }
-          rowCount += csv.appendBundleResults(results || [], ctx, exportedAt);
+          if (!computedList.length) {
+            rowCount += csv.appendComputedPolicy({ policy: { stages: [] }, results: [] }, ctx, exportedAt, scope);
+          } else {
+            for (const computed of computedList) {
+              rowCount += csv.appendComputedPolicy(computed, ctx, exportedAt, scope);
+            }
+          }
         } catch (e) {
           failedCount++;
           csv.appendRow({
