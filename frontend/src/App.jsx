@@ -1,17 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
-import { fetchProjects, fetchAllBundles, fetchComputedPolicy, fetchAllResults, pool } from './api.js';
+import { startProbe } from './api.js';
 import {
   COLUMN_GROUPS,
   ALL_COLUMNS,
   COLUMN_PRESETS,
   bundleContext,
   bundleComputedContext,
+  bundlePolicyContext,
+  bundleAnswers,
   CsvBuilder,
 } from './csv.js';
-
-const CONCURRENCY = 10;
 
 function useDebounced(value, ms) {
   const [v, setV] = useState(value);
@@ -25,77 +25,28 @@ const fmtNumber = (n) => (n ?? 0).toLocaleString();
 const isoStamp = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const fileStamp = () => new Date().toISOString().replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
-// A single bundle can have multiple policies attached (see bundle.policies[]).
-// Each one needs its own compute-policy call. Falls back to the bundle's
-// primary policyId for older payloads that only expose the legacy field.
-function bundlePolicyRefs(bundle) {
-  const list = Array.isArray(bundle.policies) ? bundle.policies : [];
-  const refs = list
-    .filter((p) => p && p.policyId)
-    .map((p) => ({ policyId: p.policyId, policyVersionId: p.policyVersionId }));
-  if (refs.length === 0 && bundle.policyId) {
-    refs.push({ policyId: bundle.policyId, policyVersionId: bundle.policyVersionId });
-  }
-  // De-dupe by policyId+versionId — bundle.policies can repeat the same policy.
-  const seen = new Set();
-  return refs.filter((r) => {
-    const k = `${r.policyId}::${r.policyVersionId || ''}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
-
-// Fetch compute-policy for every policy attached to a bundle. 404s are tolerated
-// (treated as "policy not computable for this bundle" — empty payload). 403s
-// propagate so the caller can decide whether the whole bundle is denied.
-async function fetchAllComputedForBundle(bundle) {
-  const id = bundle.id || bundle._id;
-  const refs = bundlePolicyRefs(bundle);
-  if (refs.length === 0) return [];
-  const out = [];
-  let denials = 0;
-  for (const ref of refs) {
-    try {
-      out.push(await fetchComputedPolicy(id, ref.policyId, ref.policyVersionId));
-    } catch (e) {
-      if (e && e.status === 404) continue;
-      if (e && e.status === 403) { denials++; continue; }
-      throw e;
-    }
-  }
-  // If every policy 403'd we surface that — the bundle is effectively denied.
-  if (out.length === 0 && denials > 0) {
-    const err = new Error(`compute-policy 403 for all ${denials} policies on bundle ${id}`);
-    err.status = 403;
-    throw err;
-  }
-  return out;
-}
-
 export default function App() {
-  // ── Server state ────────────────────────────────────────────────────────────
+  // ── Server state (populated from the /api/probe SSE stream) ───────────────
+  // The backend does all Domino calls and streams: projects, accessible
+  // bundles + their compute-policy payloads, and live progress.
   const [projects, setProjects] = useState([]);
-  const [allBundles, setAllBundles] = useState([]); // every bundle the list endpoint returned
+  const [bundles, setBundles] = useState([]); // accessible bundles only
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
 
-  // ── ACL probe state ────────────────────────────────────────────────────────
-  // Probe each bundle by fetching its latest evidence. If 200, the user has
-  // read access and we keep the results cached for the export. If 403, we hide
-  // the bundle. This makes the UI show ONLY actionable bundles, and the
-  // export reuses the probe payload — no second fetch at export time.
+  // ── Probe stream state ────────────────────────────────────────────────────
   const [probing, setProbing] = useState(false);
   const [probeStats, setProbeStats] = useState({ done: 0, total: 0, accessible: 0, denied: 0 });
-  const [accessibleIds, setAccessibleIds] = useState(() => new Set());
-  const probeCacheRef = useRef(new Map()); // bundleId -> computed-policy payload
+  // Upstream totals from the meta event — used to surface "N hidden (no access)".
+  const [streamCounts, setStreamCounts] = useState({ allBundles: 0, candidates: 0 });
+  // bundleId -> computed-policy payload list (delivered with each bundle event).
+  const probeCacheRef = useRef(new Map());
 
   // ── User selections ────────────────────────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [search, setSearch] = useState('');
   const debouncedSearch = useDebounced(search, 150);
   const [hideEmpty, setHideEmpty] = useState(true);
-  const [scope, setScope] = useState('latest');
   const [columns, setColumns] = useState(() => new Set(COLUMN_PRESETS.audit));
 
   // ── Export state ───────────────────────────────────────────────────────────
@@ -104,102 +55,52 @@ export default function App() {
   const [exportError, setExportError] = useState(null);
   const [lastExport, setLastExport] = useState(null);
 
-  // ── Initial load ───────────────────────────────────────────────────────────
+  // ── Load + probe: single SSE connection to the backend ────────────────────
+  // The backend resolves projects, list-bundles, and probes compute-policy per
+  // attached policy in parallel; we just listen and accumulate.
   useEffect(() => {
-    let cancelled = false;
     setLoading(true);
-    Promise.all([fetchProjects(), fetchAllBundles()])
-      .then(([projs, buns]) => {
-        if (cancelled) return;
-        setProjects(projs);
-        setAllBundles(buns);
-        setLoadError(null);
-      })
-      .catch((e) => !cancelled && setLoadError(e.message || String(e)))
-      .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; };
+    setProbing(false);
+    setLoadError(null);
+    setProjects([]);
+    setBundles([]);
+    setStreamCounts({ allBundles: 0, candidates: 0 });
+    setProbeStats({ done: 0, total: 0, accessible: 0, denied: 0 });
+    probeCacheRef.current = new Map();
+
+    const handle = startProbe((event, data) => {
+      if (event === 'meta') {
+        setProjects(data.projects || []);
+        setStreamCounts({ allBundles: data.all_bundles || 0, candidates: data.candidates || 0 });
+        setProbeStats({ done: 0, total: data.candidates || 0, accessible: 0, denied: 0 });
+        setLoading(false);
+        setProbing((data.candidates || 0) > 0);
+      } else if (event === 'bundle') {
+        const b = data.bundle;
+        if (!b) return;
+        const id = b.id || b._id;
+        probeCacheRef.current.set(id, data.computedList || []);
+        setBundles((prev) => [...prev, b]);
+      } else if (event === 'progress') {
+        setProbeStats({
+          done: data.done || 0,
+          total: data.total || 0,
+          accessible: data.accessible || 0,
+          denied: data.denied || 0,
+        });
+      } else if (event === 'done') {
+        setProbing(false);
+      } else if (event === 'error') {
+        setLoadError(`${data.stage || 'probe'}: ${data.detail || 'unknown error'}`);
+        setLoading(false);
+        setProbing(false);
+      }
+    });
+
+    return () => handle.close();
   }, []);
 
-  // ── Pre-filter: only bundles whose owning project the user can see ────────
-  // The governance /bundles endpoint returns instance-wide bundles for users
-  // with the GovernanceAdmin role, but /v4/projects only returns projects the
-  // user is a member of. Bundles whose projectId isn't in our project list will
-  // ALWAYS 403 on /results — so we drop them client-side without ever making
-  // the network call. This removes the bulk of the console noise.
-  const probeCandidates = useMemo(() => {
-    if (projects.length === 0) return [];
-    const accessibleProjectIds = new Set(projects.map((p) => p.id));
-    return allBundles.filter((b) => {
-      const pid = b.projectId || (b.project && b.project.id) || '';
-      return accessibleProjectIds.has(pid);
-    });
-  }, [allBundles, projects]);
-
-  const projectFilteredOut = allBundles.length - probeCandidates.length;
-
-  // ── ACL probe: runs once when bundles are loaded ──────────────────────────
-  useEffect(() => {
-    if (probeCandidates.length === 0) {
-      setAccessibleIds(new Set());
-      setProbing(false);
-      return;
-    }
-    let cancelled = false;
-    setProbing(true);
-    setProbeStats({ done: 0, total: probeCandidates.length, accessible: 0, denied: 0 });
-    probeCacheRef.current = new Map();
-    const accessible = new Set();
-
-    pool(
-      probeCandidates,
-      CONCURRENCY,
-      async (bundle) => {
-        const id = bundle.id || bundle._id;
-        // Bundles with no attached policy contribute no rows but should still
-        // count as accessible (so the UI surfaces them).
-        if (bundlePolicyRefs(bundle).length === 0) {
-          probeCacheRef.current.set(id, []);
-          accessible.add(id);
-          if (!cancelled) setAccessibleIds(new Set(accessible));
-          return;
-        }
-        try {
-          const computedList = await fetchAllComputedForBundle(bundle);
-          probeCacheRef.current.set(id, computedList);
-          accessible.add(id);
-          // Stream updates: as soon as we learn a bundle is accessible, add it
-          // so the project counts in the UI grow live.
-          if (!cancelled) setAccessibleIds(new Set(accessible));
-          return computedList;
-        } catch (e) {
-          throw e;
-        }
-      },
-      (p) => {
-        if (cancelled) return;
-        setProbeStats({
-          done: p.done,
-          total: p.total,
-          accessible: accessible.size,
-          denied: p.skipped + p.failed,
-        });
-      },
-    ).then(() => {
-      if (cancelled) return;
-      setAccessibleIds(new Set(accessible));
-    }).finally(() => {
-      if (cancelled) return;
-      setProbing(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [probeCandidates]);
-
-  // ── Bundles the user can actually act on ───────────────────────────────────
-  const bundles = useMemo(
-    () => allBundles.filter((b) => accessibleIds.has(b.id || b._id)),
-    [allBundles, accessibleIds],
-  );
+  const projectFilteredOut = streamCounts.allBundles - streamCounts.candidates;
 
   // ── Derived data: per-project bundle counts ───────────────────────────────
   const { bundleCountByProject, totalBundles } = useMemo(() => {
@@ -296,44 +197,30 @@ export default function App() {
     let failedCount = 0;
 
     try {
-      await pool(exportable, CONCURRENCY, async (bundle) => {
+      // The probe already delivered compute-policy for every accessible bundle
+      // and cached it in probeCacheRef. CSV construction is fully local.
+      let done = 0;
+      for (const bundle of exportable) {
         const id = bundle.id || bundle._id;
         const ctx = bundleContext(bundle, projectsById);
-        try {
-          // The probe already fetched compute-policy for every attached policy
-          // on this bundle. Re-use that cache. (compute-policy returns latest
-          // + historical results in one payload; scope filtering is client-side.)
-          let computedList = probeCacheRef.current.get(id);
-          if (!computedList) {
-            computedList = await fetchAllComputedForBundle(bundle);
-          }
-          const enrichedCtx = { ...ctx, ...bundleComputedContext(computedList) };
-          // compute-policy only includes latest results. For history scope we
-          // fetch the bundle-scoped /results endpoint (which returns every
-          // historical edit) and swap that into each computed payload — the
-          // per-artifact join still works since artifactId is globally unique.
-          let payloads = computedList;
-          if (scope === 'history' && computedList.length) {
-            const allResults = await fetchAllResults(id);
-            payloads = computedList.map((c) => ({ ...c, results: allResults }));
-          }
-          if (!payloads.length) {
-            rowCount += csv.appendComputedPolicy({ policy: { stages: [] }, results: [] }, enrichedCtx, exportedAt, scope);
-          } else {
-            for (const computed of payloads) {
-              rowCount += csv.appendComputedPolicy(computed, enrichedCtx, exportedAt, scope);
-            }
-          }
-        } catch (e) {
-          failedCount++;
-          csv.appendRow({
-            exported_at_utc: exportedAt,
-            ...ctx,
-            question_label: `(fetch error: ${e.status || 'network'} ${(e.message || '').slice(0, 80)})`,
-          });
-          rowCount++;
+        const computedList = probeCacheRef.current.get(id) || [];
+        csv.addBundle({
+          exported_at_utc: exportedAt,
+          ...ctx,
+          ...bundleComputedContext(computedList),
+          ...bundlePolicyContext(computedList),
+          export_error: '',
+        }, bundleAnswers(computedList));
+        rowCount++;
+        done++;
+        // Yield to the browser every 50 bundles so a large export doesn't
+        // freeze the progress UI.
+        if (done % 50 === 0) {
+          setProgress({ done, total: exportable.length, failed: failedCount, rows: rowCount });
+          await new Promise((r) => setTimeout(r, 0));
         }
-      }, (p) => setProgress({ done: p.done, total: p.total, failed: failedCount, rows: rowCount }));
+      }
+      setProgress({ done, total: exportable.length, failed: failedCount, rows: rowCount });
 
       const blob = csv.finalize();
       const filename = `governance-evidence_${fileStamp()}.csv`;
@@ -384,7 +271,7 @@ export default function App() {
             <div className="brand-mark">●</div>
             <div className="brand-text">
               <div className="brand-title">Governance Evidence Exporter</div>
-              <div className="brand-sub">One CSV · every bundle you can access · every answer</div>
+              <div className="brand-sub">One row per bundle · one column per question · every answer</div>
             </div>
           </div>
           <div className="masthead-stat">
@@ -393,7 +280,7 @@ export default function App() {
             <span className="dot">·</span>
             <span className="stat-n">{ready ? fmtNumber(totalBundles) : '—'}</span>
             <span className="stat-l">accessible bundles</span>
-            {probing && probeCandidates.length > 0 && (
+            {probing && streamCounts.candidates > 0 && (
               <>
                 <span className="dot">·</span>
                 <span className="stat-l probing">
@@ -401,11 +288,11 @@ export default function App() {
                 </span>
               </>
             )}
-            {!probing && ready && allBundles.length > totalBundles && (
+            {!probing && ready && streamCounts.allBundles > totalBundles && (
               <>
                 <span className="dot">·</span>
-                <span className="stat-l muted-2" title={`${fmtNumber(projectFilteredOut)} in projects you don't have access to${probeCandidates.length - totalBundles > 0 ? `, ${fmtNumber(probeCandidates.length - totalBundles)} project-reader-only` : ''}`}>
-                  {fmtNumber(allBundles.length - totalBundles)} hidden (no access)
+                <span className="stat-l muted-2" title={`${fmtNumber(projectFilteredOut)} in projects you don't have access to${streamCounts.candidates - totalBundles > 0 ? `, ${fmtNumber(streamCounts.candidates - totalBundles)} project-reader-only` : ''}`}>
+                  {fmtNumber(streamCounts.allBundles - totalBundles)} hidden (no access)
                 </span>
               </>
             )}
@@ -417,8 +304,8 @@ export default function App() {
         <div className="banner banner-err">
           <strong>Failed to load governance data:</strong> {loadError}
           <div className="banner-sub">
-            This app reads <code>/v4/projects</code> and <code>/api/governance/v1/*</code> directly from Domino using
-            your session cookie. Confirm you have access to governance bundles.
+            This app's backend talks to Domino's project and governance APIs on your behalf.
+            Confirm the app has access to governance bundles.
           </div>
         </div>
       )}
@@ -489,13 +376,16 @@ export default function App() {
 
         <section className="card cell-columns">
           <div className="card-head">
-            <div className="card-title">Columns</div>
+            <div className="card-title">Metadata columns</div>
             <div className="card-tools">
               <span className="muted">Preset:</span>
               <button className="ghost" onClick={() => applyPreset('audit')}>Audit essentials</button>
               <button className="ghost" onClick={() => applyPreset('full')}>Everything</button>
               <button className="ghost" onClick={() => applyPreset('minimal')}>Minimal</button>
             </div>
+          </div>
+          <div className="proj-hint">
+            One row per bundle. After these columns, the CSV appends one column per unique evidence question (header = question label).
           </div>
           <div className="card-body col-grid">
             {COLUMN_GROUPS.map((g) => {
@@ -538,8 +428,6 @@ export default function App() {
           {exporting ? (
             <div className="estimate">
               <strong>{fmtNumber(progress.done)}</strong> / {fmtNumber(progress.total)} bundles processed
-              {' '}·{' '}
-              <strong>{fmtNumber(progress.rows)}</strong> evidence rows
               {progress.failed > 0 && <> · <span className="warn">{progress.failed} failed</span></>}
               <div className="progress-bar">
                 <div className="progress-fill" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
@@ -571,30 +459,6 @@ export default function App() {
             </div>
           )}
           {exportError && <div className="banner-err small">{exportError}</div>}
-        </div>
-        <div className="seg" role="radiogroup" aria-label="Answer scope">
-          <button
-            type="button"
-            role="radio"
-            aria-checked={scope === 'latest'}
-            className={`seg-opt${scope === 'latest' ? ' on' : ''}`}
-            onClick={() => setScope('latest')}
-            title="One row per evidence item, showing the current answer."
-            disabled={exporting || probing}
-          >
-            Latest only
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={scope === 'history'}
-            className={`seg-opt${scope === 'history' ? ' on' : ''}`}
-            onClick={() => setScope('history')}
-            title="Add a row for every historical revision. Larger files; one extra fetch per bundle."
-            disabled={exporting || probing}
-          >
-            With history
-          </button>
         </div>
         <button className="primary" disabled={exportDisabled} onClick={handleExport}>
           {exporting ? (

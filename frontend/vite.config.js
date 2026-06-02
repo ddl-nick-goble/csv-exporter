@@ -18,7 +18,10 @@ export default defineConfig(({ command }) => {
       strictPort: true,
       allowedHosts: true,
       hmr: { clientPort: 443, protocol: 'wss' },
-      proxy: { '/api': `http://localhost:${flaskPort}` },
+      proxy: {
+        '/api': `http://localhost:${flaskPort}`,
+        '/v4': `http://localhost:${flaskPort}`,
+      },
     },
     build: { outDir: 'dist', emptyOutDir: true },
   };

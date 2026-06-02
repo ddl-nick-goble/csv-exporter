@@ -1,11 +1,15 @@
 // Streaming CSV builder + browser-side row construction.
+//
+// Output shape: ONE ROW PER BUNDLE. Metadata columns (configurable, in
+// COLUMN_GROUPS) sit on the left. After them, one column per unique evidence
+// question label across every exported bundle, with the question label as the
+// header. Cells are the latest answer for that bundle, or empty if the bundle's
+// policy doesn't include that question (or it was never answered).
 
 export const COLUMN_GROUPS = [
   { id: 'project', label: 'Project', cols: ['project_id', 'project_name', 'project_owner', 'project_owner_username'] },
-  { id: 'bundle', label: 'Bundle', cols: ['bundle_id', 'bundle_name', 'bundle_stage', 'bundle_state', 'bundle_classification', 'bundle_created_at', 'bundle_created_by'] },
-  { id: 'policy', label: 'Policy', cols: ['policy_id', 'policy_name', 'policy_version', 'policy_stage'] },
-  { id: 'evidence', label: 'Evidence', cols: ['evidence_id', 'evidence_name', 'artifact_id', 'artifact_type', 'question_label', 'answer_value', 'answer_type', 'is_required', 'is_visible', 'is_answered', 'is_latest'] },
-  { id: 'provenance', label: 'Provenance', cols: ['evidence_created_at', 'evidence_created_by', 'evidence_created_by_id'] },
+  { id: 'bundle', label: 'Bundle', cols: ['bundle_id', 'bundle_name', 'bundle_stage', 'bundle_state', 'bundle_classification', 'bundle_created_at', 'bundle_created_by', 'export_error'] },
+  { id: 'policy', label: 'Policy', cols: ['policy_id', 'policy_name', 'policy_version'] },
   { id: 'refs', label: 'Attachments & findings', cols: ['attachment_count', 'attachment_names', 'attachment_ids', 'findings_count', 'findings_open_count'] },
   { id: 'approvals', label: 'Latest approval', cols: ['latest_approval_action', 'latest_approval_stage', 'latest_approval_at', 'latest_approver'] },
 ];
@@ -13,7 +17,7 @@ export const ALL_COLUMNS = ['exported_at_utc', ...COLUMN_GROUPS.flatMap((g) => g
 export const COLUMN_PRESETS = {
   audit: ['exported_at_utc', ...COLUMN_GROUPS.filter((g) => g.id !== 'refs').flatMap((g) => g.cols)],
   full: ALL_COLUMNS,
-  minimal: ['exported_at_utc', 'project_name', 'bundle_name', 'bundle_stage', 'question_label', 'answer_value', 'evidence_created_at'],
+  minimal: ['exported_at_utc', 'project_name', 'bundle_name', 'bundle_stage'],
 };
 
 // CSV field escaping: wrap in quotes if the value contains a comma/quote/newline,
@@ -65,8 +69,8 @@ function unwrapList(data, keys = ['data', 'items', 'results']) {
 }
 
 // Per-bundle context derived from the list-level bundle. Project + bundle
-// metadata only — attachments, findings, and approval activity are NOT
-// present on the list bundle and are added later via bundleComputedContext().
+// metadata only — attachments, findings, approvals, and policy metadata come
+// from the compute-policy payloads (see bundleComputedContext / bundlePolicyContext).
 export function bundleContext(bundle, projectsById) {
   const pid = bundle.projectId || attr(bundle, 'project', 'id') || '';
   const proj = projectsById.get(pid) || {};
@@ -135,6 +139,28 @@ export function bundleComputedContext(computedList) {
   };
 }
 
+// Bundles can have multiple policies attached (bundle.policies[]) and we fetch
+// compute-policy for each. Join the per-policy ids/names/versions with '|' so
+// the bundle row keeps a single value per column.
+export function bundlePolicyContext(computedList) {
+  const list = Array.isArray(computedList) ? computedList : [];
+  const ids = [], names = [], versions = [];
+  for (const c of list) {
+    const policy = (c && c.policy) || {};
+    const bundle = (c && c.bundle) || {};
+    if (!policy.id) continue;
+    ids.push(policy.id);
+    names.push(policy.name || bundle.policyName || '');
+    const match = (bundle.policies || []).find((p) => p && p.policyId === policy.id);
+    versions.push((match && match.policyVersion) || bundle.policyVersion || '');
+  }
+  return {
+    policy_id: ids.join('|'),
+    policy_name: names.join('|'),
+    policy_version: versions.join('|'),
+  };
+}
+
 // Render a result's artifactContent into a single CSV cell value. The shape
 // varies by artifact type (string, primitive, object with .value, array, or a
 // nested map of sub-answers).
@@ -156,126 +182,80 @@ function stringifyAnswer(content) {
 // de-duped by artifact id so a question that appears in both isn't double-counted.
 function* iterStageArtifacts(stage) {
   const seen = new Set();
-  const visit = function* (artifacts, ev) {
+  const visit = function* (artifacts) {
     for (const a of (artifacts || [])) {
       const key = a.id || a.policyEntityId || '';
       if (key && seen.has(key)) continue;
       if (key) seen.add(key);
-      yield { evidence: ev || {}, artifact: a };
+      yield a;
     }
   };
   for (const ap of (stage.approvals || [])) {
-    yield* visit(ap.evidence && ap.evidence.artifacts, ap.evidence);
+    yield* visit(ap.evidence && ap.evidence.artifacts);
   }
   for (const ev of (stage.evidenceSet || [])) {
-    yield* visit(ev.artifacts, ev);
+    yield* visit(ev.artifacts);
   }
 }
 
-// One row per policy question, left-joined with recorded results.
-// `scope` filters which results are kept: 'latest' keeps only isLatest!=false;
-// 'history' keeps all (one row per historical answer + an unanswered row only
-// if no result of any kind exists for that artifact).
-export function* policyArtifactRows(computed, ctx, exportedAt, scope = 'latest') {
-  const policy = (computed && computed.policy) || {};
-  const bundle = (computed && computed.bundle) || {};
-  const allResults = (computed && computed.results) || [];
-  // The policy object itself has no version field; the version is recorded on
-  // bundle.policies[] (per-policy attachment metadata). Match by policyId, then
-  // fall back to the bundle's primary policy version.
-  const versionMatch = (bundle.policies || []).find((p) => p && p.policyId === policy.id);
-  const policyMeta = {
-    policy_id: policy.id || '',
-    policy_name: policy.name || bundle.policyName || '',
-    policy_version: (versionMatch && versionMatch.policyVersion) || bundle.policyVersion || '',
-  };
-
-  for (const stage of (policy.stages || [])) {
-    const stageId = stage.policyEntityId || stage.id || '';
-    const stageName = stage.name || stageId;
-    for (const { evidence, artifact } of iterStageArtifacts(stage)) {
-      const details = (artifact.details && typeof artifact.details === 'object') ? artifact.details : {};
-      const base = {
-        exported_at_utc: exportedAt,
-        ...ctx,
-        ...policyMeta,
-        policy_stage: stageName,
-        evidence_id: evidence.id || '',
-        evidence_name: evidence.name || '',
-        artifact_id: artifact.id || artifact.policyEntityId || '',
-        artifact_type: artifact.artifactType || details.type || '',
-        question_label: stringify(details.label) || stringify(details.name),
-        answer_type: stringify(details.type),
-        is_required: artifact.required ? 'true' : 'false',
-        is_visible: artifact.visible === false ? 'false' : 'true',
-      };
-
-      const artifactId = artifact.id || '';
-      let matches = artifactId
-        ? allResults.filter((r) => r.artifactId === artifactId)
-        : [];
-      if (scope === 'latest') {
-        matches = matches.filter((r) => r.isLatest !== false);
-      }
-
-      if (matches.length === 0) {
-        yield {
-          ...base,
-          answer_value: '',
-          is_answered: 'false',
-          is_latest: '',
-          evidence_created_at: '',
-          evidence_created_by: '',
-          evidence_created_by_id: '',
-        };
-        continue;
-      }
-
-      for (const r of matches) {
-        yield {
-          ...base,
-          evidence_id: r.evidenceId || base.evidence_id,
-          answer_value: stringifyAnswer(r.artifactContent),
-          is_answered: 'true',
-          is_latest: r.isLatest === false ? 'false' : 'true',
-          evidence_created_at: r.createdAt || '',
-          evidence_created_by: userDisplay(r.createdBy),
-          evidence_created_by_id: attr(r, 'createdBy', 'id') || '',
-        };
+// Collect { questionLabel -> latestAnswerString } across every policy attached
+// to a bundle. If the same label appears in multiple stages/policies, prefer
+// a non-empty answer over an empty one (otherwise first-wins).
+export function bundleAnswers(computedList) {
+  const out = {};
+  for (const computed of (computedList || [])) {
+    const policy = (computed && computed.policy) || {};
+    const results = (computed && computed.results) || [];
+    for (const stage of (policy.stages || [])) {
+      for (const artifact of iterStageArtifacts(stage)) {
+        const details = (artifact.details && typeof artifact.details === 'object') ? artifact.details : {};
+        const label = stringify(details.label) || stringify(details.name);
+        if (!label) continue;
+        const artifactId = artifact.id || '';
+        const latest = artifactId
+          ? results.find((r) => r.artifactId === artifactId && r.isLatest !== false)
+          : null;
+        const value = latest ? stringifyAnswer(latest.artifactContent) : '';
+        if (!(label in out) || (value && !out[label])) {
+          out[label] = value;
+        }
       }
     }
   }
+  return out;
 }
 
-// Streaming CSV writer — append rows in order; finalize() returns the full Blob.
+// Two-pass CSV writer: collect per-bundle data, then finalize() emits the file
+// once the full set of question columns is known.
 export class CsvBuilder {
-  constructor(columns) {
-    this.columns = columns;
-    this.parts = [row(columns)];
+  constructor(metaColumns) {
+    this.metaColumns = metaColumns;
+    this.bundles = [];
+    this.questionLabels = new Set();
   }
-  appendRow(rowObj) {
-    this.parts.push(row(this.columns.map((c) => rowObj[c] ?? '')));
+  addBundle(meta, answers) {
+    const a = answers || {};
+    for (const label of Object.keys(a)) this.questionLabels.add(label);
+    this.bundles.push({ meta: meta || {}, answers: a });
   }
-  appendComputedPolicy(computed, ctx, exportedAt, scope = 'latest') {
-    let n = 0;
-    for (const ev of policyArtifactRows(computed, ctx, exportedAt, scope)) {
-      this.appendRow(ev);
-      n++;
-    }
-    if (n === 0) {
-      // No policy artifacts at all (bundle has no policy or empty policy).
-      this.appendRow({ exported_at_utc: exportedAt, ...ctx, question_label: '(no policy artifacts)' });
-      return 1;
-    }
-    return n;
+  get rowCount() {
+    return this.bundles.length;
+  }
+  get questionCount() {
+    return this.questionLabels.size;
   }
   finalize() {
-    return new Blob(this.parts, { type: 'text/csv;charset=utf-8' });
-  }
-  approxSize() {
-    let n = 0;
-    for (const p of this.parts) n += p.length;
-    return n;
+    const sortedQuestions = [...this.questionLabels].sort((a, b) => a.localeCompare(b));
+    const headers = [...this.metaColumns, ...sortedQuestions];
+    const parts = [row(headers)];
+    for (const b of this.bundles) {
+      const cells = [
+        ...this.metaColumns.map((c) => b.meta[c] ?? ''),
+        ...sortedQuestions.map((q) => b.answers[q] ?? ''),
+      ];
+      parts.push(row(cells));
+    }
+    return new Blob(parts, { type: 'text/csv;charset=utf-8' });
   }
 }
 

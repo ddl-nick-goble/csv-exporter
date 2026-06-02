@@ -1,5 +1,5 @@
 // Dev proxy: Domino strips the /proxy/$PORT prefix before forwarding here.
-//   /api/*  → Flask (forwarded as-is)
+//   /api/*  → Flask (Flask makes all Domino calls server-side)
 //   rest    → Vite (prefix re-added; Vite's base is the full Domino path)
 // HMR websocket upgrades are forwarded to Vite.
 import httpProxy from 'http-proxy';
@@ -25,11 +25,11 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
-const isApi = (url) => url === '/api' || url.startsWith('/api/');
+const isBackend = (url) => url === '/api' || url.startsWith('/api/');
 const prefixUrl = (url) => (url.startsWith(PREFIX + '/') || url === PREFIX ? url : PREFIX + url);
 
 const server = http.createServer((req, res) => {
-  if (isApi(req.url)) {
+  if (isBackend(req.url)) {
     proxy.web(req, res, { target: FLASK_TARGET });
   } else {
     req.url = prefixUrl(req.url);
@@ -43,5 +43,5 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[proxy] :${PORT}  /api/* → ${FLASK_TARGET}  rest → ${VITE_TARGET} (prefix "${PREFIX}")`);
+  console.log(`[proxy] :${PORT}  /api/*,/v4/* → ${FLASK_TARGET}  rest → ${VITE_TARGET} (prefix "${PREFIX}")`);
 });
