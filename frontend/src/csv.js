@@ -1,24 +1,28 @@
 // Streaming CSV builder + browser-side row construction.
 //
-// Output shape: ONE ROW PER BUNDLE. Metadata columns (configurable, in
-// COLUMN_GROUPS) sit on the left. After them, one column per unique evidence
-// question label across every exported bundle, with the question label as the
-// header. Cells are the latest answer for that bundle, or empty if the bundle's
-// policy doesn't include that question (or it was never answered).
+// Output shape: one row per bundle. Metadata columns (fixed; not user-configurable)
+// sit on the left, then one column per *selected* evidence question with the
+// question label as the header. The selection is policy- and question-driven —
+// see derivePolicyOutlines() and how App.jsx wires its picker to bundleAnswers().
 
-export const COLUMN_GROUPS = [
-  { id: 'project', label: 'Project', cols: ['project_id', 'project_name', 'project_owner', 'project_owner_username'] },
-  { id: 'bundle', label: 'Bundle', cols: ['bundle_id', 'bundle_name', 'bundle_stage', 'bundle_state', 'bundle_classification', 'bundle_created_at', 'bundle_created_by', 'export_error'] },
-  { id: 'policy', label: 'Policy', cols: ['policy_id', 'policy_name', 'policy_version'] },
-  { id: 'refs', label: 'Attachments & findings', cols: ['attachment_count', 'attachment_names', 'attachment_ids', 'findings_count', 'findings_open_count'] },
-  { id: 'approvals', label: 'Latest approval', cols: ['latest_approval_action', 'latest_approval_stage', 'latest_approval_at', 'latest_approver'] },
+// Fixed metadata column set. Always written, in this order.
+export const META_COLUMNS = [
+  'exported_at_utc',
+  'project_name',
+  'bundle_id',
+  'bundle_name',
+  'bundle_stage',
+  'bundle_state',
+  'bundle_classification',
+  'bundle_created_at',
+  'bundle_created_by',
+  'policy_name',
+  'policy_version',
+  'latest_approval_action',
+  'latest_approval_at',
+  'latest_approver',
+  'export_error',
 ];
-export const ALL_COLUMNS = ['exported_at_utc', ...COLUMN_GROUPS.flatMap((g) => g.cols)];
-export const COLUMN_PRESETS = {
-  audit: ['exported_at_utc', ...COLUMN_GROUPS.filter((g) => g.id !== 'refs').flatMap((g) => g.cols)],
-  full: ALL_COLUMNS,
-  minimal: ['exported_at_utc', 'project_name', 'bundle_name', 'bundle_stage'],
-};
 
 // CSV field escaping: wrap in quotes if the value contains a comma/quote/newline,
 // and double any embedded quotes.
@@ -57,27 +61,13 @@ function userDisplay(u) {
   return full || u.userName || '';
 }
 
-function unwrapList(data, keys = ['data', 'items', 'results']) {
-  if (data == null) return [];
-  if (Array.isArray(data)) return data;
-  if (typeof data === 'object') {
-    for (const k of keys) {
-      if (Array.isArray(data[k])) return data[k];
-    }
-  }
-  return [];
-}
-
-// Per-bundle context derived from the list-level bundle. Project + bundle
-// metadata only — attachments, findings, approvals, and policy metadata come
-// from the compute-policy payloads (see bundleComputedContext / bundlePolicyContext).
+// Per-bundle context derived from the list-level bundle.
 export function bundleContext(bundle, projectsById) {
   const pid = bundle.projectId || attr(bundle, 'project', 'id') || '';
   const proj = projectsById.get(pid) || {};
   return {
     project_id: pid,
     project_name: proj.name || bundle.projectName || '',
-    project_owner: proj.owner_name || bundle.projectOwner || '',
     project_owner_username: proj.owner_username || '',
     bundle_id: bundle.id || bundle._id || '',
     bundle_name: bundle.name || '',
@@ -89,15 +79,9 @@ export function bundleContext(bundle, projectsById) {
   };
 }
 
-// Derive attachment / findings / latest-approval columns from the array of
-// compute-policy payloads cached for a bundle. These fields are only available
-// in the compute-policy response (and partly on the per-bundle GET endpoint).
-//
-// - bundle.attachments is repeated across each payload (it's bundle-level);
-//   we take the first non-empty list.
-// - findingsInfo.bundleFindingsCount is bundle-level too; pick the max we see.
-// - approvals[] is per-policy; we union across payloads, then sort by
-//   updatedAt and report the most recent.
+// Attachment / findings / latest-approval columns from the compute-policy payloads.
+// (Same join semantics as before: bundle-level fields are taken from the first
+// payload that has them; approvals are union-merged and the most recent wins.)
 export function bundleComputedContext(computedList) {
   const list = Array.isArray(computedList) ? computedList : [];
   let attachments = [];
@@ -126,22 +110,16 @@ export function bundleComputedContext(computedList) {
   const approverNames = (latest.approvers || []).map((a) => a && a.name).filter(Boolean).join('|');
   return {
     attachment_count: String(attachments.length),
-    attachment_names: attachments.map((a) => stringify(attr(a, 'identifier', 'name') || a.name)).join('|'),
-    attachment_ids: attachments.map((a) => stringify(a && (a.id || a._id))).join('|'),
     findings_count: String(findingsCount),
     findings_open_count: String(openFindings),
-    // status is the approval state ("PendingSubmission", "Approved", "Rejected" …);
-    // there is no separate "action" field in this API.
     latest_approval_action: latest.status || '',
-    latest_approval_stage: latest.name || '',
     latest_approval_at: latest.updatedAt || '',
     latest_approver: userDisplay(latest.updatedBy) || approverNames,
   };
 }
 
-// Bundles can have multiple policies attached (bundle.policies[]) and we fetch
-// compute-policy for each. Join the per-policy ids/names/versions with '|' so
-// the bundle row keeps a single value per column.
+// Policy id/name/version joined across the multiple compute-policy payloads
+// attached to a bundle.
 export function bundlePolicyContext(computedList) {
   const list = Array.isArray(computedList) ? computedList : [];
   const ids = [], names = [], versions = [];
@@ -161,9 +139,7 @@ export function bundlePolicyContext(computedList) {
   };
 }
 
-// Render a result's artifactContent into a single CSV cell value. The shape
-// varies by artifact type (string, primitive, object with .value, array, or a
-// nested map of sub-answers).
+// Render a result's artifactContent into a single CSV cell value.
 function stringifyAnswer(content) {
   if (content == null) return '';
   if (typeof content === 'string' || typeof content === 'number' || typeof content === 'boolean') return String(content);
@@ -177,47 +153,156 @@ function stringifyAnswer(content) {
   return String(content);
 }
 
-// Walk every policy artifact (question) reachable from a stage. Combines the
-// artifacts referenced by approvals[].evidence and the stage-level evidenceSet[],
-// de-duped by artifact id so a question that appears in both isn't double-counted.
-function* iterStageArtifacts(stage) {
+// Walk every policy artifact (question) reachable from a stage, grouped by
+// section. Order is intentional: evidence sections come first, then approval
+// sections at the end of the stage — approvals gate the stage transition, so
+// readers naturally consume the gate last. Each approval section is prepended
+// with a synthetic "status" entry so the approval's outcome (Approved /
+// PendingSubmission / Rejected / …) can be selected and exported alongside the
+// approver's textual answers. Duplicates (same artifact id) are dropped within
+// a stage so the outline doesn't repeat a question that the policy lists in
+// multiple places.
+function* iterStageSections(stage) {
   const seen = new Set();
-  const visit = function* (artifacts) {
-    for (const a of (artifacts || [])) {
-      const key = a.id || a.policyEntityId || '';
-      if (key && seen.has(key)) continue;
-      if (key) seen.add(key);
-      yield a;
-    }
+
+  // Special artifact types (modelmetric, monitorcheck, scriptedCheck, file,
+  // metadata) don't always populate details.label/name. The bare UUID is
+  // useless as a column header, so fall back to the section name before id.
+  const labelFor = (a, sectionName) => {
+    const details = (a.details && typeof a.details === 'object') ? a.details : {};
+    return stringify(details.label) ||
+           stringify(details.name) ||
+           sectionName ||
+           (a.id || a.policyEntityId || '');
   };
-  for (const ap of (stage.approvals || [])) {
-    yield* visit(ap.evidence && ap.evidence.artifacts);
-  }
+
   for (const ev of (stage.evidenceSet || [])) {
-    yield* visit(ev.artifacts);
+    const sectionName = ev.name || 'Evidence';
+    const questions = [];
+    for (const a of (ev.artifacts || [])) {
+      const id = a.id || a.policyEntityId || '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      questions.push({ id, label: labelFor(a, sectionName), required: !!a.required });
+    }
+    if (questions.length) {
+      yield { kind: 'evidence', name: sectionName, questions };
+    }
+  }
+
+  for (const ap of (stage.approvals || [])) {
+    const ev = (ap && ap.evidence) || {};
+    const approvalName = ap.name || ev.name || 'Approval';
+    const approvalKey = ap.policyEntityId || ap.id || approvalName;
+    const statusId = `__status__::${approvalKey}`;
+    const questions = [{
+      id: statusId,
+      label: `${approvalName} — approval status`,
+      required: false,
+      isStatus: true,
+      approvalName,
+    }];
+    for (const a of (ev.artifacts || [])) {
+      const id = a.id || a.policyEntityId || '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      questions.push({ id, label: labelFor(a, approvalName), required: !!a.required });
+    }
+    yield { kind: 'approval', name: approvalName, questions, approvalName };
   }
 }
 
-// Collect { questionLabel -> latestAnswerString } across every policy attached
-// to a bundle. If the same label appears in multiple stages/policies, prefer
-// a non-empty answer over an empty one (otherwise first-wins).
-export function bundleAnswers(computedList) {
+// Walks every bundle's compute-policy payloads and produces a deduped, ordered
+// list of policy outlines. First-seen policy structure wins (different bundles
+// may pin different policy versions; the differences in question shape are
+// negligible compared to the cost of representing them all).
+//
+//   [{
+//     id, name, version,
+//     bundleIds: Set<string>,
+//     stages: [{ id, name, sections: [{ kind, name, questions: [{id, label, required}] }] }],
+//   }]
+export function derivePolicyOutlines(bundles, computedByBundleId) {
+  const byId = new Map();
+  for (const bundle of bundles) {
+    const bid = bundle.id || bundle._id;
+    const list = computedByBundleId.get(bid) || [];
+    for (const computed of list) {
+      const policy = (computed && computed.policy) || {};
+      const pid = policy.id;
+      if (!pid) continue;
+      let outline = byId.get(pid);
+      if (!outline) {
+        const versionMatch = (((computed.bundle || {}).policies) || [])
+          .find((p) => p && p.policyId === pid);
+        const stages = [];
+        for (const stage of (policy.stages || [])) {
+          const sections = [];
+          for (const sec of iterStageSections(stage)) {
+            sections.push(sec);
+          }
+          if (sections.length) {
+            stages.push({
+              id: stage.policyEntityId || stage.id || stage.name || '',
+              name: stage.name || 'Stage',
+              sections,
+            });
+          }
+        }
+        outline = {
+          id: pid,
+          name: policy.name || '(unnamed policy)',
+          version: (versionMatch && versionMatch.policyVersion) || '',
+          bundleIds: new Set(),
+          stages,
+        };
+        byId.set(pid, outline);
+      }
+      outline.bundleIds.add(bid);
+    }
+  }
+  return [...byId.values()].sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '')
+  );
+}
+
+// Collect { artifactId -> latestAnswerString } for the artifacts that pass
+// isSelected. If isSelected is null/undefined, every answered artifact is kept.
+// Synthetic "status" entries (q.isStatus) are resolved against the bundle's
+// approvals[] by matching approval name and taking the most recent updatedAt.
+export function bundleAnswers(computedList, isSelected) {
+  const accept = typeof isSelected === 'function' ? isSelected : () => true;
   const out = {};
   for (const computed of (computedList || [])) {
     const policy = (computed && computed.policy) || {};
     const results = (computed && computed.results) || [];
+
+    // approvals[] holds the current approval records; same name can appear
+    // multiple times across history — pick the latest by updatedAt.
+    const statusByName = new Map();
+    for (const ap of (computed?.approvals || [])) {
+      const name = ap && ap.name;
+      if (!name) continue;
+      const cur = statusByName.get(name);
+      if (!cur || (ap.updatedAt || '').localeCompare(cur.updatedAt || '') > 0) {
+        statusByName.set(name, ap);
+      }
+    }
+
     for (const stage of (policy.stages || [])) {
-      for (const artifact of iterStageArtifacts(stage)) {
-        const details = (artifact.details && typeof artifact.details === 'object') ? artifact.details : {};
-        const label = stringify(details.label) || stringify(details.name);
-        if (!label) continue;
-        const artifactId = artifact.id || '';
-        const latest = artifactId
-          ? results.find((r) => r.artifactId === artifactId && r.isLatest !== false)
-          : null;
-        const value = latest ? stringifyAnswer(latest.artifactContent) : '';
-        if (!(label in out) || (value && !out[label])) {
-          out[label] = value;
+      for (const sec of iterStageSections(stage)) {
+        for (const q of sec.questions) {
+          if (!accept(q.id)) continue;
+          if (q.isStatus) {
+            const ap = statusByName.get(q.approvalName);
+            const val = ap && ap.status ? String(ap.status) : '';
+            if (q.id in out && !val) continue;
+            out[q.id] = val;
+            continue;
+          }
+          const latest = results.find((r) => r.artifactId === q.id && r.isLatest !== false);
+          if (q.id in out && !latest) continue;
+          out[q.id] = latest ? stringifyAnswer(latest.artifactContent) : (out[q.id] ?? '');
         }
       }
     }
@@ -225,38 +310,23 @@ export function bundleAnswers(computedList) {
   return out;
 }
 
-// Two-pass CSV writer: collect per-bundle data, then finalize() emits the file
-// once the full set of question columns is known.
+// Two-pass CSV writer. metaCols is the fixed list of metadata column keys;
+// questionCols is the ordered [{ id, label }] of selected question columns
+// (the id is used to look up the per-bundle answer; the label is the header).
 export class CsvBuilder {
-  constructor(metaColumns) {
-    this.metaColumns = metaColumns;
-    this.bundles = [];
-    this.questionLabels = new Set();
+  constructor(metaCols, questionCols) {
+    this.metaCols = metaCols;
+    this.questionCols = questionCols;
   }
-  addBundle(meta, answers) {
-    const a = answers || {};
-    for (const label of Object.keys(a)) this.questionLabels.add(label);
-    this.bundles.push({ meta: meta || {}, answers: a });
-  }
-  get rowCount() {
-    return this.bundles.length;
-  }
-  get questionCount() {
-    return this.questionLabels.size;
-  }
-  finalize() {
-    const sortedQuestions = [...this.questionLabels].sort((a, b) => a.localeCompare(b));
-    const headers = [...this.metaColumns, ...sortedQuestions];
+  build(bundleRows) {
+    const headers = [...this.metaCols, ...this.questionCols.map((q) => q.label)];
     const parts = [row(headers)];
-    for (const b of this.bundles) {
-      const cells = [
-        ...this.metaColumns.map((c) => b.meta[c] ?? ''),
-        ...sortedQuestions.map((q) => b.answers[q] ?? ''),
-      ];
-      parts.push(row(cells));
+    for (const b of bundleRows) {
+      parts.push(row([
+        ...this.metaCols.map((c) => b.meta[c] ?? ''),
+        ...this.questionCols.map((q) => b.answers[q.id] ?? ''),
+      ]));
     }
     return new Blob(parts, { type: 'text/csv;charset=utf-8' });
   }
 }
-
-export { unwrapList };
