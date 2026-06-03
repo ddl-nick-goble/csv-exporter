@@ -212,58 +212,63 @@ function* iterStageSections(stage) {
   }
 }
 
-// Walks every bundle's compute-policy payloads and produces a deduped, ordered
-// list of policy outlines. First-seen policy structure wins (different bundles
-// may pin different policy versions; the differences in question shape are
-// negligible compared to the cost of representing them all).
+function policyOutline(policy) {
+  const stages = [];
+  for (const stage of (policy.stages || [])) {
+    const sections = [];
+    for (const sec of iterStageSections(stage)) sections.push(sec);
+    if (sections.length) {
+      stages.push({
+        id: stage.policyEntityId || stage.id || stage.name || '',
+        name: stage.name || 'Stage',
+        sections,
+      });
+    }
+  }
+  return {
+    id: policy.id,
+    name: policy.name || '(unnamed policy)',
+    version: '',
+    bundleIds: new Set(),
+    stages,
+  };
+}
+
+// Build the picker outline list from server-fetched policy definitions plus
+// the bundle list. Each outline gets its bundleIds populated from bundles[]
+// whose bundle.policies[*].policyId or top-level policyId matches.
 //
 //   [{
 //     id, name, version,
 //     bundleIds: Set<string>,
 //     stages: [{ id, name, sections: [{ kind, name, questions: [{id, label, required}] }] }],
 //   }]
-export function derivePolicyOutlines(bundles, computedByBundleId) {
+export function buildPolicyOutlines(policies, bundles) {
   const byId = new Map();
-  for (const bundle of bundles) {
-    const bid = bundle.id || bundle._id;
-    const list = computedByBundleId.get(bid) || [];
-    for (const computed of list) {
-      const policy = (computed && computed.policy) || {};
-      const pid = policy.id;
-      if (!pid) continue;
-      let outline = byId.get(pid);
-      if (!outline) {
-        const versionMatch = (((computed.bundle || {}).policies) || [])
-          .find((p) => p && p.policyId === pid);
-        const stages = [];
-        for (const stage of (policy.stages || [])) {
-          const sections = [];
-          for (const sec of iterStageSections(stage)) {
-            sections.push(sec);
-          }
-          if (sections.length) {
-            stages.push({
-              id: stage.policyEntityId || stage.id || stage.name || '',
-              name: stage.name || 'Stage',
-              sections,
-            });
-          }
-        }
-        outline = {
-          id: pid,
-          name: policy.name || '(unnamed policy)',
-          version: (versionMatch && versionMatch.policyVersion) || '',
-          bundleIds: new Set(),
-          stages,
-        };
-        byId.set(pid, outline);
-      }
+  for (const p of (policies || [])) {
+    if (!p || !p.id) continue;
+    byId.set(p.id, policyOutline(p));
+  }
+  // Attach bundle counts + take the version from a referencing bundle (all
+  // bundles pin a specific version; first-seen wins for the displayed label).
+  for (const b of (bundles || [])) {
+    const bid = b.id || b._id;
+    if (!bid) continue;
+    const refs = (b.policies && b.policies.length) ? b.policies
+                 : (b.policyId ? [{ policyId: b.policyId, policyVersion: b.policyVersion }] : []);
+    for (const r of refs) {
+      const outline = byId.get(r && r.policyId);
+      if (!outline) continue;
       outline.bundleIds.add(bid);
+      if (!outline.version && r.policyVersion) outline.version = r.policyVersion;
     }
   }
-  return [...byId.values()].sort((a, b) =>
-    (a.name || '').localeCompare(b.name || '')
+  // Drop outlines with no questions (defensive — happens if a policy has only
+  // empty stages, which would render as an empty card in the picker).
+  const out = [...byId.values()].filter((o) =>
+    o.stages.some((s) => s.sections.some((sec) => sec.questions.length))
   );
+  return out.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 }
 
 // Collect { artifactId -> latestAnswerString } for the artifacts that pass
@@ -311,16 +316,17 @@ export function bundleAnswers(computedList, isSelected) {
 }
 
 // Two-pass CSV writer. metaCols is the fixed list of metadata column keys;
-// questionCols is the ordered [{ id, label }] of selected question columns
-// (the id is used to look up the per-bundle answer; the label is the header).
+// questionCols is the ordered [{ id, label, header? }] of selected question
+// columns (id looks up the per-bundle answer; header — falling back to label —
+// is the CSV column heading).
 export class CsvBuilder {
   constructor(metaCols, questionCols) {
     this.metaCols = metaCols;
     this.questionCols = questionCols;
   }
   build(bundleRows) {
-    const headers = [...this.metaCols, ...this.questionCols.map((q) => q.label)];
-    const parts = [row(headers)];
+    const headers = [...this.metaCols, ...this.questionCols.map((q) => q.header || q.label)];
+    const parts = ['﻿', row(headers)];
     for (const b of bundleRows) {
       parts.push(row([
         ...this.metaCols.map((c) => b.meta[c] ?? ''),

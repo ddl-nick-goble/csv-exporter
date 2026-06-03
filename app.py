@@ -5,13 +5,17 @@ The browser talks ONLY to this app's endpoints. All Domino API calls happen
 server-side; the frontend has no knowledge of Domino's URL structure.
 
 Endpoints:
-    GET  /api/probe   Server-Sent Events. Emits, in order:
-                        meta     — { projects, all_bundles, candidates }
-                        bundle   — { bundle, computedList }  (per accessible bundle)
-                        progress — { done, total, accessible, denied }
-                        done     — {}            (terminal)
-                        error    — { stage, detail }   (fatal)
-    GET  /api/health  Liveness.
+    GET  /api/load     One-shot JSON. Returns { projects, bundles, policies }.
+                       Picker renders directly from this — no per-bundle work
+                       on load. Policy definitions are deduped: 700 bundles
+                       referencing 150 unique policies = 150 /policies/{id}
+                       calls, not 700+ compute-policy calls.
+
+    POST /api/evidence body: { bundleIds: [...] }
+                       Returns { <bundleId>: [computedList...] }. Called at
+                       export time, only for the bundles being exported.
+
+    GET  /api/health   Liveness.
 
 Auth + routing:
   The governance API (/api/governance/v1/*) is NOT part of Domino's Public API.
@@ -21,16 +25,9 @@ Auth + routing:
   the same host the Domino UI talks to. It accepts a short-lived bearer token
   from $DOMINO_API_PROXY/access-token. We resolve the host once, mint/refresh
   the token as needed, and call upstream as this run's identity (the
-  workspace/app owner). Per-bundle 403s are how we detect lack of access.
-
-Probe model:
-  We pre-filter bundles to those whose project the user can see (/v4/projects
-  only returns projects the user is a member of, while /bundles can return
-  instance-wide bundles for GovernanceAdmins — calls on the latter will 403).
-  We then probe the survivors in parallel: a bundle is "accessible" if at least
-  one of its attached policies returns 200 from compute-policy. 404 on a single
-  policy means the policy isn't computable on this bundle — skip it, keep the
-  bundle. 403 on every attached policy means the user can't see the bundle.
+  workspace/app owner). /bundles already enforces per-user access — for
+  GovernanceAdmins it returns instance-wide bundles, for others it returns
+  only bundles whose project they can see.
 
 Static serving: anything that isn't /api/* is served from frontend/dist/
 (SPA fallback to index.html).
@@ -44,14 +41,27 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from flask import Flask, Response, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
+from requests.adapters import HTTPAdapter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "frontend", "dist")
 
 API_PROXY = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899").rstrip("/")
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
-PROBE_CONCURRENCY = int(os.environ.get("PROBE_CONCURRENCY", "10"))
+FETCH_CONCURRENCY = int(os.environ.get("FETCH_CONCURRENCY", "25"))
+
+# Shared session: keep-alive + a connection pool sized to FETCH_CONCURRENCY
+# saves a TLS handshake per upstream call (the single biggest win when
+# fanning out hundreds of small GETs to the same host).
+_session = requests.Session()
+_adapter = HTTPAdapter(
+    pool_connections=FETCH_CONCURRENCY,
+    pool_maxsize=FETCH_CONCURRENCY,
+    pool_block=False,
+)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
 
 log = logging.getLogger("governance-exporter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -117,7 +127,7 @@ def _domino(method, path, params=None, json_body=None):
     url = f"{host}/{path.lstrip('/')}"
 
     def call(force):
-        return requests.request(
+        return _session.request(
             method, url,
             params=params,
             json=json_body,
@@ -194,8 +204,8 @@ def _fetch_bundles():
 
 
 def _bundle_policy_refs(bundle):
-    """Every policy attached to a bundle needs its own compute-policy call. Older
-    bundles only expose the primary policy via the legacy top-level field."""
+    """Every policy attached to a bundle. Older bundles only expose the primary
+    policy via the legacy top-level field."""
     refs = []
     seen = set()
     for p in (bundle.get("policies") or []):
@@ -218,38 +228,79 @@ def _bundle_policy_refs(bundle):
     return refs
 
 
-def _probe_bundle(bundle):
-    """Returns (computed_list, accessible). accessible=False means every attached
-    policy 403'd → the user can't see the bundle."""
+def _fetch_policy(pid):
+    """Full policy definition (stages → evidenceSet → artifacts → questions).
+    Returns None if the user can't see this policy (403/404)."""
+    resp = _domino("GET", f"api/governance/v1/policies/{pid}")
+    if resp.status_code in (403, 404):
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_policies_for_bundles(bundles):
+    """Fetch every unique policy referenced by any bundle, in parallel."""
+    pids = set()
+    for b in bundles:
+        for ref in _bundle_policy_refs(b):
+            pids.add(ref["policyId"])
+    if not pids:
+        return []
+    out = []
+    with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+        futures = {ex.submit(_fetch_policy, pid): pid for pid in pids}
+        for f in as_completed(futures):
+            pid = futures[f]
+            try:
+                pol = f.result()
+            except Exception as e:
+                log.warning("policy fetch failed for %s: %s", pid, e)
+                continue
+            if pol:
+                out.append(pol)
+    return out
+
+
+def _compute_policy(bundle_id, policy_id, policy_version_id=None):
+    """One compute-policy call for a (bundle, policy) pair. Returns the
+    computed payload or None if the user can't compute it (403/404)."""
+    body = {"bundleId": bundle_id, "policyId": policy_id}
+    if policy_version_id:
+        body["policyVersionId"] = policy_version_id
+    resp = _domino("POST", "api/governance/v1/rpc/compute-policy", json_body=body)
+    if resp.status_code in (403, 404):
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_evidence_for_bundle(bundle):
+    """Returns computedList for one bundle by calling compute-policy for each
+    of the bundle's attached policies in parallel."""
     bid = bundle.get("id") or bundle.get("_id")
     refs = _bundle_policy_refs(bundle)
-    # Bundles with no attached policy contribute no answers but are still
-    # accessible (so the UI can surface them).
-    if not refs:
-        return [], True
+    if not bid or not refs:
+        return bid, []
     out = []
-    denials = 0
-    for ref in refs:
-        body = {"bundleId": bid, "policyId": ref["policyId"]}
-        if ref.get("policyVersionId"):
-            body["policyVersionId"] = ref["policyVersionId"]
-        resp = _domino("POST", "api/governance/v1/rpc/compute-policy", json_body=body)
-        if resp.status_code == 404:
-            # Policy not computable on this bundle — skip the policy, keep the bundle.
-            continue
-        if resp.status_code == 403:
-            denials += 1
-            continue
-        if not resp.ok:
-            resp.raise_for_status()
-        out.append(resp.json())
-    if not out and denials > 0:
-        return None, False
-    return out, True
-
-
-def _sse(event, data):
-    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+    # For multi-policy bundles, fan out the per-policy calls — most bundles
+    # have one policy so this is a no-op for them.
+    if len(refs) == 1:
+        ref = refs[0]
+        payload = _compute_policy(bid, ref["policyId"], ref.get("policyVersionId"))
+        if payload:
+            out.append(payload)
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(refs), 4)) as ex:
+            futs = [ex.submit(_compute_policy, bid, r["policyId"], r.get("policyVersionId")) for r in refs]
+            for f in futs:
+                try:
+                    payload = f.result()
+                except Exception as e:
+                    log.warning("compute-policy failed for bundle %s: %s", bid, e)
+                    continue
+                if payload:
+                    out.append(payload)
+    return bid, out
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -259,76 +310,76 @@ def health():
     return {"ok": True, "dist": os.path.isdir(DIST)}
 
 
-@app.get("/api/probe")
-def probe():
-    """Stream everything the UI needs in one connection."""
-    def gen():
-        try:
-            projects = _fetch_projects()
-        except Exception as e:
-            log.exception("projects fetch failed")
-            yield _sse("error", {"stage": "projects", "detail": str(e)})
-            return
+@app.get("/api/load")
+def load():
+    """One-shot picker payload. Parallel-fetches projects + bundles, then
+    parallel-fetches every unique policy definition. No compute-policy on
+    the hot path."""
+    t0 = time.time()
+    try:
+        # projects + bundles in parallel — they're independent.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_projects = ex.submit(_fetch_projects)
+            fut_bundles = ex.submit(_fetch_bundles)
+            projects = fut_projects.result()
+            bundles = fut_bundles.result()
+    except Exception as e:
+        log.exception("load: projects/bundles fetch failed")
+        return jsonify({"error": "load_failed", "detail": str(e)}), 502
 
-        try:
-            all_bundles = _fetch_bundles()
-        except Exception as e:
-            log.exception("bundles fetch failed")
-            yield _sse("error", {"stage": "bundles", "detail": str(e)})
-            return
+    try:
+        policies = _fetch_policies_for_bundles(bundles)
+    except Exception as e:
+        log.exception("load: policies fetch failed")
+        return jsonify({"error": "policies_failed", "detail": str(e)}), 502
 
-        # Pre-filter: only bundles whose owning project the user can see. The
-        # rest will ALWAYS 403 on compute-policy — drop them without ever making
-        # the call so the probe doesn't spend network time on guaranteed denials.
-        accessible_pids = {p["id"] for p in projects}
-        candidates = [
-            b for b in all_bundles
-            if (b.get("projectId") or (b.get("project") or {}).get("id") or "") in accessible_pids
-        ]
-
-        yield _sse("meta", {
-            "projects": projects,
-            "all_bundles": len(all_bundles),
-            "candidates": len(candidates),
-        })
-
-        if not candidates:
-            yield _sse("done", {})
-            return
-
-        done = 0
-        accessible = 0
-        denied = 0
-
-        with ThreadPoolExecutor(max_workers=PROBE_CONCURRENCY) as ex:
-            futures = {ex.submit(_probe_bundle, b): b for b in candidates}
-            for f in as_completed(futures):
-                bundle = futures[f]
-                try:
-                    computed_list, ok = f.result()
-                except Exception as e:
-                    log.warning("probe failed for bundle %s: %s", bundle.get("id"), e)
-                    ok = False
-                    computed_list = None
-                done += 1
-                if ok:
-                    accessible += 1
-                    yield _sse("bundle", {"bundle": bundle, "computedList": computed_list})
-                else:
-                    denied += 1
-                yield _sse("progress", {
-                    "done": done,
-                    "total": len(candidates),
-                    "accessible": accessible,
-                    "denied": denied,
-                })
-
-        yield _sse("done", {})
-
-    return Response(gen(), mimetype="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
+    log.info("load: %d projects, %d bundles, %d policies in %.2fs",
+             len(projects), len(bundles), len(policies), time.time() - t0)
+    return jsonify({
+        "projects": projects,
+        "bundles": bundles,
+        "policies": policies,
     })
+
+
+@app.post("/api/evidence")
+def evidence():
+    """Fetch compute-policy payloads for the given bundle IDs. Used at export
+    time once the user has chosen which bundles to include."""
+    body = request.get_json(silent=True) or {}
+    ids = body.get("bundleIds") or []
+    if not isinstance(ids, list):
+        return jsonify({"error": "bundleIds must be a list"}), 400
+    if not ids:
+        return jsonify({"results": {}})
+
+    # We need bundle objects to know their attached policies — re-list and
+    # filter (cheap, one call), avoids needing the client to send back the
+    # full bundle each time.
+    try:
+        all_bundles = _fetch_bundles()
+    except Exception as e:
+        log.exception("evidence: bundles fetch failed")
+        return jsonify({"error": "bundles_failed", "detail": str(e)}), 502
+
+    wanted = set(ids)
+    targets = [b for b in all_bundles if (b.get("id") or b.get("_id")) in wanted]
+
+    results = {}
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+        futures = {ex.submit(_fetch_evidence_for_bundle, b): b for b in targets}
+        for f in as_completed(futures):
+            b = futures[f]
+            try:
+                bid, computed_list = f.result()
+            except Exception as e:
+                log.warning("evidence fetch failed for bundle %s: %s", b.get("id"), e)
+                continue
+            if bid:
+                results[bid] = computed_list
+    log.info("evidence: %d/%d bundles in %.2fs", len(results), len(ids), time.time() - t0)
+    return jsonify({"results": results})
 
 
 # ── Static React bundle ──────────────────────────────────────────────────────

@@ -1,13 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
-import { startProbe } from './api.js';
+import { load, fetchEvidence } from './api.js';
 import {
   META_COLUMNS,
   bundleContext,
   bundleComputedContext,
   bundlePolicyContext,
   bundleAnswers,
-  derivePolicyOutlines,
+  buildPolicyOutlines,
   CsvBuilder,
 } from './csv.js';
 
@@ -68,22 +68,20 @@ function artifactIdsForSection(section) {
 }
 
 export default function App() {
-  // ── Server state (populated from the /api/probe SSE stream) ───────────────
+  // ── Server state (populated from one /api/load call) ──────────────────────
   const [projects, setProjects] = useState([]);
   const [bundles, setBundles] = useState([]);
+  const [serverPolicies, setServerPolicies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
 
-  // ── Probe stream state ────────────────────────────────────────────────────
-  const [probing, setProbing] = useState(false);
-  const [probeStats, setProbeStats] = useState({ done: 0, total: 0, accessible: 0, denied: 0 });
-  const [streamCounts, setStreamCounts] = useState({ allBundles: 0, candidates: 0 });
+  // Evidence is fetched at export time only — see handleExport.
   const probeCacheRef = useRef(new Map());
 
   // ── User selections ────────────────────────────────────────────────────────
   const [selectedProjectIds, setSelectedProjectIds] = useState(() => new Set());
-  // null = "every question selected" (sentinel — saves materializing huge sets
-  // during streaming probe). First interaction materializes to a real Set.
+  // null = "every question selected" sentinel; first interaction materializes
+  // to a real Set so we don't have to enumerate every question id up front.
   const [selectedArtifactIds, setSelectedArtifactIds] = useState(null);
   const [projectSearch, setProjectSearch] = useState('');
   const debouncedSearch = useDebounced(projectSearch, 120);
@@ -102,55 +100,36 @@ export default function App() {
   const [exportError, setExportError] = useState(null);
   const [lastExport, setLastExport] = useState(null);
 
-  // ── Load + probe ───────────────────────────────────────────────────────────
+  // ── Load ──────────────────────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
-    setProbing(false);
     setLoadError(null);
     setProjects([]);
     setBundles([]);
-    setStreamCounts({ allBundles: 0, candidates: 0 });
-    setProbeStats({ done: 0, total: 0, accessible: 0, denied: 0 });
+    setServerPolicies([]);
     probeCacheRef.current = new Map();
-
-    const handle = startProbe((event, data) => {
-      if (event === 'meta') {
-        setProjects(data.projects || []);
-        setStreamCounts({ allBundles: data.all_bundles || 0, candidates: data.candidates || 0 });
-        setProbeStats({ done: 0, total: data.candidates || 0, accessible: 0, denied: 0 });
-        setLoading(false);
-        setProbing((data.candidates || 0) > 0);
-      } else if (event === 'bundle') {
-        const b = data.bundle;
-        if (!b) return;
-        const id = b.id || b._id;
-        probeCacheRef.current.set(id, data.computedList || []);
-        setBundles((prev) => [...prev, b]);
-      } else if (event === 'progress') {
-        setProbeStats({
-          done: data.done || 0,
-          total: data.total || 0,
-          accessible: data.accessible || 0,
-          denied: data.denied || 0,
-        });
-      } else if (event === 'done') {
-        setProbing(false);
-      } else if (event === 'error') {
-        setLoadError(`${data.stage || 'probe'}: ${data.detail || 'unknown error'}`);
-        setLoading(false);
-        setProbing(false);
+    (async () => {
+      try {
+        const payload = await load();
+        if (cancelled) return;
+        setProjects(payload.projects || []);
+        setBundles(payload.bundles || []);
+        setServerPolicies(payload.policies || []);
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-    });
-
-    return () => handle.close();
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // ── Derived ────────────────────────────────────────────────────────────────
-  // Re-deriving on every bundle event during the probe is O(bundles * policies);
-  // policies stay small so this is fine in practice.
   const policies = useMemo(
-    () => derivePolicyOutlines(bundles, probeCacheRef.current),
-    [bundles],
+    () => buildPolicyOutlines(serverPolicies, bundles),
+    [serverPolicies, bundles],
   );
 
   const { bundleCountByProject, projectsWithBundles } = useMemo(() => {
@@ -246,38 +225,59 @@ export default function App() {
     });
   }, [bundles, selectedProjectIds]);
 
-  // A bundle is exportable if at least one of its compute-policy payloads has
-  // a selected artifact (real question) OR a selected synthetic "approval
-  // status" entry — drop bundles whose every policy is fully turned off.
+  // For each policy, the set of bundle ids that reference it, and the set of
+  // its own artifact ids (questions + synthetic statuses). Used to compute
+  // "exportable" without per-bundle evidence — purely from the bundle ↔ policy
+  // references in the bundle list.
+  const policyArtifactIds = useMemo(() => {
+    const m = new Map();
+    for (const p of policies) m.set(p.id, new Set(artifactIdsForPolicy(p)));
+    return m;
+  }, [policies]);
+
+  const bundlePolicyIds = useMemo(() => {
+    // bundle.id -> Set<policyId> from the bundle's policies[] refs (or the
+    // legacy top-level policyId).
+    const m = new Map();
+    for (const b of bundles) {
+      const bid = b.id || b._id;
+      if (!bid) continue;
+      const set = new Set();
+      const refs = (b.policies && b.policies.length) ? b.policies : (b.policyId ? [{ policyId: b.policyId }] : []);
+      for (const r of refs) if (r && r.policyId) set.add(r.policyId);
+      m.set(bid, set);
+    }
+    return m;
+  }, [bundles]);
+
+  // A bundle is exportable if any of its attached policies has at least one
+  // selected question. Computed from the bundle ↔ policy ↔ question graph the
+  // server returns at load time — no per-bundle compute-policy needed.
   const exportable = useMemo(() => {
     if (selectedCount === 0) return [];
-    if (selectedArtifactIds === null) return projectMatchedBundles;
+    if (selectedArtifactIds === null) {
+      // Every question selected → every bundle attached to a known policy.
+      return projectMatchedBundles.filter((b) => {
+        const pids = bundlePolicyIds.get(b.id || b._id) || new Set();
+        for (const pid of pids) if (policyArtifactIds.has(pid)) return true;
+        return false;
+      });
+    }
     return projectMatchedBundles.filter((b) => {
-      const id = b.id || b._id;
-      const list = probeCacheRef.current.get(id) || [];
-      for (const c of list) {
-        const policy = c?.policy;
-        if (!policy) continue;
-        for (const stage of (policy.stages || [])) {
-          for (const ev of (stage.evidenceSet || [])) {
-            for (const a of (ev.artifacts || [])) {
-              if (selectedArtifactIds.has(a.id)) return true;
-            }
-          }
-          for (const ap of (stage.approvals || [])) {
-            const key = ap.policyEntityId || ap.id || ap.name || '';
-            if (selectedArtifactIds.has(`__status__::${key}`)) return true;
-            for (const a of (ap?.evidence?.artifacts || [])) {
-              if (selectedArtifactIds.has(a.id)) return true;
-            }
-          }
-        }
+      const pids = bundlePolicyIds.get(b.id || b._id) || new Set();
+      for (const pid of pids) {
+        const ids = policyArtifactIds.get(pid);
+        if (!ids) continue;
+        for (const aid of ids) if (selectedArtifactIds.has(aid)) return true;
       }
       return false;
     });
-  }, [projectMatchedBundles, selectedArtifactIds, selectedCount]);
+  }, [projectMatchedBundles, selectedArtifactIds, selectedCount, bundlePolicyIds, policyArtifactIds]);
 
   // Selected question columns, ordered by policy → stage → section.
+  // CSV header prefixes the question with its policy name so the same question
+  // label appearing under multiple policies (e.g. "Model Purpose Document")
+  // stays disambiguated in the export.
   const questionCols = useMemo(() => {
     const out = [];
     for (const p of policies) {
@@ -285,7 +285,11 @@ export default function App() {
         for (const sec of s.sections) {
           for (const q of sec.questions) {
             if (isQuestionSelected(q.id)) {
-              out.push({ id: q.id, label: q.label });
+              out.push({
+                id: q.id,
+                label: q.label,
+                header: `${p.name}: ${q.label}`,
+              });
             }
           }
         }
@@ -308,6 +312,18 @@ export default function App() {
     const rows = [];
 
     try {
+      // Fetch evidence (compute-policy payloads) for exactly the bundles being
+      // exported. This is the expensive step that used to run at load time.
+      const idsToFetch = exportable
+        .map((b) => b.id || b._id)
+        .filter((id) => id && !probeCacheRef.current.has(id));
+      if (idsToFetch.length) {
+        const results = await fetchEvidence(idsToFetch);
+        for (const [bid, computedList] of Object.entries(results)) {
+          probeCacheRef.current.set(bid, computedList);
+        }
+      }
+
       let done = 0;
       for (const bundle of exportable) {
         const id = bundle.id || bundle._id;
@@ -367,7 +383,7 @@ export default function App() {
   // ── Render ─────────────────────────────────────────────────────────────────
   const ready = !loading && !loadError;
   const totalBundles = bundles.length;
-  const exportDisabled = exporting || !ready || probing
+  const exportDisabled = exporting || !ready
     || exportable.length === 0 || questionCols.length === 0;
   const projectFilterLabel = selectedProjectIds.size === 0
     ? `All (${fmtNumber(projectsWithBundles)})`
@@ -393,22 +409,6 @@ export default function App() {
             <span className="dot">·</span>
             <span className="stat-n">{ready ? fmtNumber(policies.length) : '—'}</span>
             <span className="stat-l">policies</span>
-            {probing && streamCounts.candidates > 0 && (
-              <>
-                <span className="dot">·</span>
-                <span className="stat-l probing">
-                  <span className="spin sm" /> checking access {fmtNumber(probeStats.done)}/{fmtNumber(probeStats.total)}
-                </span>
-              </>
-            )}
-            {!probing && ready && streamCounts.allBundles > totalBundles && (
-              <>
-                <span className="dot">·</span>
-                <span className="stat-l muted-2" title="bundles in projects you can't access, or bundles where every attached policy 403'd">
-                  {fmtNumber(streamCounts.allBundles - totalBundles)} hidden
-                </span>
-              </>
-            )}
           </div>
         </div>
       </header>
@@ -478,9 +478,7 @@ export default function App() {
         {loading ? (
           <div className="policy-empty">Loading projects and bundles…</div>
         ) : policies.length === 0 ? (
-          <div className="policy-empty">
-            {probing ? 'Probing accessible bundles…' : 'No accessible policies found.'}
-          </div>
+          <div className="policy-empty">No accessible policies found.</div>
         ) : (
           policies.map((policy) => {
             const pState = policyState(policy);
@@ -595,16 +593,6 @@ export default function App() {
                 <div className="progress-fill" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
               </div>
             </div>
-          ) : probing ? (
-            <div className="estimate">
-              <strong>{fmtNumber(probeStats.done)}</strong> / {fmtNumber(probeStats.total)} bundles checked
-              {' '}·{' '}
-              <strong>{fmtNumber(probeStats.accessible)}</strong> accessible
-              {probeStats.denied > 0 && <> · <span className="muted-2">{fmtNumber(probeStats.denied)} denied</span></>}
-              <div className="progress-bar">
-                <div className="progress-fill" style={{ width: `${(probeStats.done / Math.max(1, probeStats.total)) * 100}%` }} />
-              </div>
-            </div>
           ) : (
             <div className="estimate">
               Will export <strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'}
@@ -624,8 +612,6 @@ export default function App() {
         <button className="primary" disabled={exportDisabled} onClick={handleExport}>
           {exporting ? (
             <><span className="spin" /> Generating CSV…</>
-          ) : probing ? (
-            <><span className="spin" /> Checking access…</>
           ) : (
             <>↓ Export governance evidence to CSV</>
           )}
