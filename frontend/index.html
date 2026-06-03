@@ -4,6 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Governance Evidence Exporter</title>
+  <script>
+    // Apply theme before paint to avoid a light-flash on dark-mode loads.
+    // Mirrors the logic in src/theme.js — kept inline so it runs synchronously
+    // before the React bundle parses.
+    (function () {
+      try {
+        var stored = null;
+        try { stored = localStorage.getItem('governance-exporter:theme'); } catch (e) {}
+        var theme = (stored === 'light' || stored === 'dark')
+          ? stored
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', theme);
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
   <div id="root"></div>

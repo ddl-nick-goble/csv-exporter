@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { load, fetchEvidence } from './api.js';
 import {
@@ -10,6 +10,8 @@ import {
   buildPolicyOutlines,
   CsvBuilder,
 } from './csv.js';
+import * as presetStore from './presets.js';
+import * as themeStore from './theme.js';
 
 function useDebounced(value, ms) {
   const [v, setV] = useState(value);
@@ -19,6 +21,28 @@ function useDebounced(value, ms) {
   }, [value, ms]);
   return v;
 }
+
+function useColumnCount() {
+  const [cols, setCols] = useState(3);
+  useEffect(() => {
+    const mql2 = window.matchMedia('(max-width: 880px)');
+    const mql1 = window.matchMedia('(max-width: 600px)');
+    const update = () => {
+      if (mql1.matches) setCols(1);
+      else if (mql2.matches) setCols(2);
+      else setCols(3);
+    };
+    update();
+    mql2.addEventListener('change', update);
+    mql1.addEventListener('change', update);
+    return () => {
+      mql2.removeEventListener('change', update);
+      mql1.removeEventListener('change', update);
+    };
+  }, []);
+  return cols;
+}
+
 const fmtNumber = (n) => (n ?? 0).toLocaleString();
 const isoStamp = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const fileStamp = () => new Date().toISOString().replace(/[:.]/g, '').slice(0, 15) + 'Z';
@@ -38,6 +62,60 @@ function Tristate({ state, onChange, ariaLabel, className }) {
       onChange={() => onChange(state === 'all' ? 'none' : 'all')}
       aria-label={ariaLabel}
     />
+  );
+}
+
+function phaseLabel(phase) {
+  if (phase === 'fetching') return 'Fetching evidence…';
+  if (phase === 'building')  return 'Building CSV…';
+  if (phase === 'downloading') return 'Downloading…';
+  return 'Generating CSV…';
+}
+
+function fmtDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s - m * 60}s`;
+}
+
+// Detailed export status panel — phase label, X/N, percentage, throughput,
+// ETA, and the most-recent bundle name so the user can see things move.
+function ExportProgress({ progress }) {
+  const { phase = 'fetching', done = 0, total = 0, failed = 0, currentName = '', startedAt = 0 } = progress;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const elapsed = startedAt ? Date.now() - startedAt : 0;
+  const rate = elapsed > 250 && done > 0 ? done / (elapsed / 1000) : 0;
+  const remaining = rate > 0 && total > done ? (total - done) / rate * 1000 : 0;
+  return (
+    <div className="estimate export-progress">
+      <div className="export-progress-line">
+        <span className="export-phase">{phaseLabel(phase)}</span>
+        <span className="dot">·</span>
+        <strong>{fmtNumber(done)}</strong>
+        <span className="muted"> / {fmtNumber(total)}</span>
+        <span className="muted"> ({pct}%)</span>
+        {failed > 0 && <>
+          <span className="dot">·</span>
+          <span className="warn">{fmtNumber(failed)} failed</span>
+        </>}
+        {rate > 0 && phase === 'fetching' && <>
+          <span className="dot">·</span>
+          <span className="muted">{rate.toFixed(1)}/s</span>
+          {remaining > 0 && <>
+            <span className="dot">·</span>
+            <span className="muted">~{fmtDuration(remaining)} left</span>
+          </>}
+        </>}
+      </div>
+      <div className="progress-bar">
+        <div className={`progress-fill${phase === 'downloading' ? ' done' : ''}`} style={{ width: `${pct}%` }} />
+      </div>
+      {currentName && phase === 'fetching' && (
+        <div className="export-current muted small" title={currentName}>{currentName}</div>
+      )}
+    </div>
   );
 }
 
@@ -67,12 +145,156 @@ function artifactIdsForSection(section) {
   return section.questions.map((q) => q.id);
 }
 
+// ── Memoized sub-components ───────────────────────────────────────────────────
+
+// One checkbox row. `checked` is a plain boolean → React.memo bails out for
+// every row whose checked state didn't change on a given toggle.
+const QuestionRow = React.memo(function QuestionRow({ id, label, isStatus, checked, onToggleQuestion }) {
+  const handleChange = useCallback(() => onToggleQuestion(id), [onToggleQuestion, id]);
+  return (
+    <li className={`policy-q${isStatus ? ' status-q' : ''}`}>
+      <label>
+        <input type="checkbox" checked={checked} onChange={handleChange} />
+        <span className="policy-q-label" title={label}>{label}</span>
+      </label>
+    </li>
+  );
+});
+
+// PolicyCard bails out when neither the selection state scalars nor the
+// collapsed flag changed. selectedArtifactIds is intentionally excluded from
+// the comparator: onCount already changes whenever a question in this policy
+// is toggled, so it is a reliable proxy for "re-render needed".
+function policyCardPropsEqual(prev, next) {
+  return (
+    prev.policy === next.policy &&
+    prev.pState === next.pState &&
+    prev.onCount === next.onCount &&
+    prev.collapsed === next.collapsed &&
+    prev.onToggleCollapsed === next.onToggleCollapsed &&
+    prev.onSetPolicySelection === next.onSetPolicySelection &&
+    prev.onSetSectionSelection === next.onSetSectionSelection &&
+    prev.onToggleQuestion === next.onToggleQuestion
+  );
+}
+
+const PolicyCard = React.memo(function PolicyCard({
+  policy, pState, onCount, collapsed,
+  onToggleCollapsed, onSetPolicySelection, onSetSectionSelection, onToggleQuestion,
+  selectedArtifactIds,
+}) {
+  const totalQ = artifactIdsForPolicy(policy).length;
+  const isSelected = (id) => selectedArtifactIds === null ? true : selectedArtifactIds.has(id);
+  const sectionState = (sec) => {
+    if (selectedArtifactIds === null) return 'all';
+    let on = 0;
+    for (const q of sec.questions) if (selectedArtifactIds.has(q.id)) on++;
+    if (on === 0) return 'none';
+    if (on === sec.questions.length) return 'all';
+    return 'some';
+  };
+  return (
+    <section className={`policy-card${pState === 'none' ? ' off' : ''}${collapsed ? ' collapsed' : ''}`}>
+      <header className="policy-card-head">
+        <Tristate
+          state={pState}
+          onChange={(target) => onSetPolicySelection(policy, target)}
+          ariaLabel={`Include policy ${policy.name}`}
+          className="policy-master"
+        />
+        <div className="policy-name" title={policy.name}>
+          {policy.name}
+          {policy.version && <span className="policy-version">v{policy.version}</span>}
+        </div>
+        <div className="policy-count">
+          <span className={pState === 'some' ? 'emph' : ''}>{onCount}</span>
+          <span>/{totalQ}</span>
+        </div>
+        <button
+          type="button"
+          className="policy-collapse"
+          onClick={() => onToggleCollapsed(policy.id)}
+          aria-label={collapsed ? `Expand ${policy.name}` : `Collapse ${policy.name}`}
+          aria-expanded={!collapsed}
+        >
+          <span className="caret">▾</span>
+        </button>
+      </header>
+      {!collapsed && (
+        <div className="policy-card-body">
+          {policy.stages.map((stage, stageIdx) => (
+            <div className="stage-card" key={stage.id || stageIdx}>
+              <div className="stage-head">
+                <span className="stage-label">STAGE {stageIdx + 1}</span>
+                <span className="stage-name" title={stage.name}>{stage.name}</span>
+              </div>
+              <div className="stage-body">
+                {stage.sections.map((sec, secIdx) => {
+                  const sState = sectionState(sec);
+                  const total = sec.questions.length;
+                  const sOn = selectedArtifactIds === null
+                    ? total
+                    : sec.questions.filter((q) => selectedArtifactIds.has(q.id)).length;
+                  return (
+                    <div
+                      key={secIdx}
+                      className={`section-card section-${sec.kind}${sState === 'none' ? ' off' : ''}`}
+                    >
+                      <div className="section-head">
+                        <Tristate
+                          state={sState}
+                          onChange={(target) => onSetSectionSelection(sec, target)}
+                          ariaLabel={`Include section ${sec.name}`}
+                          className="section-master"
+                        />
+                        {sec.kind === 'approval' && (
+                          <span className="sec-kind sec-approval">Approval</span>
+                        )}
+                        <span className="section-name" title={sec.name}>{sec.name}</span>
+                        <span className="section-count">
+                          <span className={sState === 'some' ? 'emph' : ''}>{sOn}</span>
+                          <span>/{total}</span>
+                        </span>
+                      </div>
+                      <ul className="policy-q-list">
+                        {sec.questions.map((q) => (
+                          <QuestionRow
+                            key={q.id}
+                            id={q.id}
+                            label={q.label}
+                            isStatus={!!q.isStatus}
+                            checked={isSelected(q.id)}
+                            onToggleQuestion={onToggleQuestion}
+                          />
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          <div className="policy-card-foot muted small">
+            {policy.bundleIds.size} bundle{policy.bundleIds.size === 1 ? '' : 's'}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}, policyCardPropsEqual);
+
 export default function App() {
-  // ── Server state (populated from one /api/load call) ──────────────────────
+  // ── Server state ──────────────────────────────────────────────────────────
+  const numCols = useColumnCount();
+
+  // metaReady flips first (projects + bundles arrive together, fast); then
+  // policiesReady flips when policy definitions land. The picker uses both
+  // signals to drive distinct loading visuals.
   const [projects, setProjects] = useState([]);
   const [bundles, setBundles] = useState([]);
   const [serverPolicies, setServerPolicies] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [metaReady, setMetaReady] = useState(false);
+  const [policiesReady, setPoliciesReady] = useState(false);
   const [loadError, setLoadError] = useState(null);
 
   // Evidence is fetched at export time only — see handleExport.
@@ -86,43 +308,105 @@ export default function App() {
   const [projectSearch, setProjectSearch] = useState('');
   const debouncedSearch = useDebounced(projectSearch, 120);
   const [collapsedPolicies, setCollapsedPolicies] = useState(() => new Set());
-  const togglePolicyCollapsed = (id) => setCollapsedPolicies((prev) => {
+  const togglePolicyCollapsed = useCallback((id) => setCollapsedPolicies((prev) => {
     const next = new Set(prev);
     next.has(id) ? next.delete(id) : next.add(id);
     return next;
-  });
+  }), []);
   const collapseAllPolicies = () => setCollapsedPolicies(new Set(policies.map((p) => p.id)));
   const expandAllPolicies = () => setCollapsedPolicies(new Set());
 
   // ── Export state ───────────────────────────────────────────────────────────
   const [exporting, setExporting] = useState(false);
-  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [progress, setProgress] = useState({
+    phase: 'fetching', done: 0, total: 0, failed: 0, currentName: '', startedAt: 0,
+  });
   const [exportError, setExportError] = useState(null);
   const [lastExport, setLastExport] = useState(null);
 
-  // ── Load ──────────────────────────────────────────────────────────────────
+  // ── Theme ─────────────────────────────────────────────────────────────────
+  const [theme, setTheme] = useState(() => themeStore.effective());
+  const toggleTheme = () => setTheme(themeStore.toggle());
+
+  // Click outside any open .proj-filter <details> closes it. Native <details>
+  // doesn't do this on its own, and the two dropdowns share the same class
+  // so one listener covers both (and any future ones).
+  useEffect(() => {
+    const onPointerDown = (e) => {
+      if (e.target.closest && e.target.closest('.proj-filter')) return;
+      document.querySelectorAll('.proj-filter[open]').forEach((d) => {
+        d.removeAttribute('open');
+      });
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, []);
+
+  // ── Presets (localStorage) ────────────────────────────────────────────────
+  const [presets, setPresets] = useState(() => presetStore.readAll());
+  const [presetName, setPresetName] = useState('');
+  const [presetMsg, setPresetMsg] = useState('');
+  const saveCurrentPreset = () => {
+    const name = presetName.trim();
+    if (!name) return;
+    const payload = {
+      name,
+      projectIds: Array.from(selectedProjectIds),
+      artifactIds: selectedArtifactIds === null ? null : Array.from(selectedArtifactIds),
+    };
+    const list = presetStore.save(payload);
+    setPresets(list);
+    setPresetName('');
+    setPresetMsg(`Saved "${name}"`);
+    setTimeout(() => setPresetMsg(''), 2000);
+  };
+  const applyPreset = (preset) => {
+    if (!preset) return;
+    setSelectedProjectIds(new Set(Array.isArray(preset.projectIds) ? preset.projectIds : []));
+    setSelectedArtifactIds(preset.artifactIds === null ? null : new Set(preset.artifactIds || []));
+    setPresetMsg(`Applied "${preset.name}"`);
+    setTimeout(() => setPresetMsg(''), 2000);
+  };
+  const deletePreset = (name) => setPresets(presetStore.remove(name));
+  const clearAllPresets = () => {
+    if (!presets.length) return;
+    if (typeof window !== 'undefined'
+        && !window.confirm(`Remove all ${presets.length} saved preset${presets.length === 1 ? '' : 's'}?`)) {
+      return;
+    }
+    presetStore.clearAll();
+    setPresets([]);
+    setPresetMsg('Cleared all presets');
+    setTimeout(() => setPresetMsg(''), 2000);
+  };
+
+  // ── Load (progressive stream) ─────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     setLoadError(null);
     setProjects([]);
     setBundles([]);
     setServerPolicies([]);
+    setMetaReady(false);
+    setPoliciesReady(false);
     probeCacheRef.current = new Map();
-    (async () => {
-      try {
-        const payload = await load();
+    load({
+      onMeta: ({ projects, bundles }) => {
         if (cancelled) return;
-        setProjects(payload.projects || []);
-        setBundles(payload.bundles || []);
-        setServerPolicies(payload.policies || []);
-      } catch (e) {
+        setProjects(projects || []);
+        setBundles(bundles || []);
+        setMetaReady(true);
+      },
+      onPolicies: ({ policies }) => {
         if (cancelled) return;
-        setLoadError(e.message || String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+        setServerPolicies(policies || []);
+        setPoliciesReady(true);
+      },
+      onError: ({ stage, detail }) => {
+        if (cancelled) return;
+        setLoadError(`${stage || 'load'}: ${detail || 'unknown error'}`);
+      },
+    });
     return () => { cancelled = true; };
   }, []);
 
@@ -131,6 +415,20 @@ export default function App() {
     () => buildPolicyOutlines(serverPolicies, bundles),
     [serverPolicies, bundles],
   );
+
+  // Pre-computed flat list of all artifact ids — kept in a ref so the selection
+  // state updaters can read it without closing over `policies`, which lets
+  // toggleQuestion/set*Selection be stable useCallback([]) instances.
+  const allArtifactIdsRef = useRef([]);
+  useMemo(() => { allArtifactIdsRef.current = flattenArtifactIds(policies); }, [policies]);
+
+  // Distribute policies into columns round-robin so cards never reorder when
+  // a card is expanded — each card stays in its assigned column forever.
+  const policyColumns = useMemo(() => {
+    const cols = Array.from({ length: numCols }, () => []);
+    policies.forEach((p, i) => cols[i % numCols].push(p));
+    return cols;
+  }, [policies, numCols]);
 
   const { bundleCountByProject, projectsWithBundles } = useMemo(() => {
     const byProj = new Map();
@@ -163,6 +461,18 @@ export default function App() {
   // Question selection helpers — treat null as "all selected".
   const totalQuestions = useMemo(() => flattenArtifactIds(policies).length, [policies]);
   const selectedCount = selectedArtifactIds === null ? totalQuestions : selectedArtifactIds.size;
+  // A policy "counts as selected" if at least one of its questions is selected.
+  const selectedPolicyCount = useMemo(() => {
+    if (selectedCount === 0) return 0;
+    if (selectedArtifactIds === null) return policies.length;
+    let n = 0;
+    for (const p of policies) {
+      for (const id of artifactIdsForPolicy(p)) {
+        if (selectedArtifactIds.has(id)) { n++; break; }
+      }
+    }
+    return n;
+  }, [policies, selectedArtifactIds, selectedCount]);
   const isQuestionSelected = (id) =>
     selectedArtifactIds === null ? true : selectedArtifactIds.has(id);
 
@@ -178,31 +488,31 @@ export default function App() {
   const policyState = (policy) => setStateFromIds(artifactIdsForPolicy(policy));
   const sectionStateOf = (section) => setStateFromIds(artifactIdsForSection(section));
 
-  const toggleQuestion = (id) => {
+  const toggleQuestion = useCallback((id) => {
     setSelectedArtifactIds((prev) => {
-      const next = new Set(prev === null ? flattenArtifactIds(policies) : prev);
+      const next = new Set(prev === null ? allArtifactIdsRef.current : prev);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
-  };
-  const setPolicySelection = (policy, target) => {
+  }, []);
+  const setPolicySelection = useCallback((policy, target) => {
     setSelectedArtifactIds((prev) => {
-      const next = new Set(prev === null ? flattenArtifactIds(policies) : prev);
+      const next = new Set(prev === null ? allArtifactIdsRef.current : prev);
       const ids = artifactIdsForPolicy(policy);
       if (target === 'all') for (const id of ids) next.add(id);
       else for (const id of ids) next.delete(id);
       return next;
     });
-  };
-  const setSectionSelection = (section, target) => {
+  }, []);
+  const setSectionSelection = useCallback((section, target) => {
     setSelectedArtifactIds((prev) => {
-      const next = new Set(prev === null ? flattenArtifactIds(policies) : prev);
+      const next = new Set(prev === null ? allArtifactIdsRef.current : prev);
       const ids = artifactIdsForSection(section);
       if (target === 'all') for (const id of ids) next.add(id);
       else for (const id of ids) next.delete(id);
       return next;
     });
-  };
+  }, []);
   const setAllQuestions = (target) => {
     setSelectedArtifactIds(target === 'all' ? null : new Set());
   };
@@ -299,51 +609,116 @@ export default function App() {
   }, [policies, selectedArtifactIds]);
 
   // ── Export ─────────────────────────────────────────────────────────────────
+  // phase: 'fetching' | 'building' | 'downloading' — drives the action-bar UI.
   const handleExport = async () => {
     if (exportable.length === 0 || questionCols.length === 0) return;
     setExporting(true);
     setExportError(null);
     setLastExport(null);
-    setProgress({ done: 0, total: exportable.length });
+    setProgress({
+      phase: 'fetching',
+      done: 0,
+      total: exportable.length,
+      failed: 0,
+      currentName: '',
+      startedAt: Date.now(),
+    });
 
     const exportedAt = isoStamp();
     const projectsById = new Map(projects.map((p) => [p.id, p]));
     const accept = (id) => isQuestionSelected(id);
     const rows = [];
+    const failures = new Map(); // bundleId -> error detail
+    // Cap update frequency so we don't trigger a render per arrival on huge
+    // exports — once every animation frame is enough for a smooth bar.
+    let pendingProgress = null;
+    let rafScheduled = false;
+    const flushProgress = () => {
+      rafScheduled = false;
+      if (pendingProgress) {
+        setProgress(pendingProgress);
+        pendingProgress = null;
+      }
+    };
+    const scheduleProgress = (next) => {
+      pendingProgress = next;
+      if (!rafScheduled) {
+        rafScheduled = true;
+        requestAnimationFrame(flushProgress);
+      }
+    };
 
     try {
-      // Fetch evidence (compute-policy payloads) for exactly the bundles being
-      // exported. This is the expensive step that used to run at load time.
-      const idsToFetch = exportable
-        .map((b) => b.id || b._id)
-        .filter((id) => id && !probeCacheRef.current.has(id));
+      const exportableIds = exportable.map((b) => b.id || b._id).filter(Boolean);
+      const idsToFetch = exportableIds.filter((id) => !probeCacheRef.current.has(id));
+
       if (idsToFetch.length) {
-        const results = await fetchEvidence(idsToFetch);
-        for (const [bid, computedList] of Object.entries(results)) {
-          probeCacheRef.current.set(bid, computedList);
-        }
+        let fetched = 0;
+        let failed = 0;
+        let total = idsToFetch.length;
+        const t0 = Date.now();
+        await fetchEvidence(idsToFetch, {
+          onStart: ({ total: t }) => {
+            total = t || idsToFetch.length;
+            scheduleProgress({
+              phase: 'fetching', done: 0, total, failed: 0, currentName: '', startedAt: t0,
+            });
+          },
+          onBundle: ({ id, name, computedList }) => {
+            probeCacheRef.current.set(id, computedList || []);
+            fetched++;
+            scheduleProgress({
+              phase: 'fetching', done: fetched + failed, total, failed,
+              currentName: name || '', startedAt: t0,
+            });
+          },
+          onBundleError: ({ id, name, detail }) => {
+            failed++;
+            failures.set(id, detail || 'fetch failed');
+            scheduleProgress({
+              phase: 'fetching', done: fetched + failed, total, failed,
+              currentName: name || '', startedAt: t0,
+            });
+          },
+        });
+        // Make sure the last in-flight render is applied before moving on.
+        flushProgress();
       }
 
+      // Phase 2: build CSV rows.
+      setProgress({
+        phase: 'building', done: 0, total: exportable.length, failed: failures.size,
+        currentName: '', startedAt: Date.now(),
+      });
+
       let done = 0;
+      let lastTick = performance.now();
       for (const bundle of exportable) {
         const id = bundle.id || bundle._id;
         const computedList = probeCacheRef.current.get(id) || [];
+        const failure = failures.get(id);
         const meta = {
           exported_at_utc: exportedAt,
           ...bundleContext(bundle, projectsById),
           ...bundleComputedContext(computedList),
           ...bundlePolicyContext(computedList),
-          export_error: '',
+          export_error: failure || '',
         };
         rows.push({ meta, answers: bundleAnswers(computedList, accept) });
         done++;
-        if (done % 50 === 0) {
-          setProgress({ done, total: exportable.length });
+        // Yield to the browser every ~32ms so the spinner can paint, but no
+        // more often than that — saves render cost on large exports.
+        if (performance.now() - lastTick > 32) {
+          setProgress((prev) => ({ ...prev, done, currentName: bundle.name || '' }));
           await new Promise((r) => setTimeout(r, 0));
+          lastTick = performance.now();
         }
       }
-      setProgress({ done, total: exportable.length });
+      setProgress((prev) => ({ ...prev, done, currentName: '' }));
 
+      // Phase 3: write blob + trigger download.
+      setProgress((prev) => ({ ...prev, phase: 'downloading' }));
+      await new Promise((r) => setTimeout(r, 0));
       const csv = new CsvBuilder(META_COLUMNS, questionCols);
       const blob = csv.build(rows);
       const filename = `governance-evidence_${fileStamp()}.csv`;
@@ -360,6 +735,7 @@ export default function App() {
         size: blob.size,
         rows: rows.length,
         questions: questionCols.length,
+        failed: failures.size,
         at: new Date(),
       });
     } catch (e) {
@@ -381,7 +757,10 @@ export default function App() {
   });
 
   // ── Render ─────────────────────────────────────────────────────────────────
-  const ready = !loading && !loadError;
+  const ready = metaReady && policiesReady && !loadError;
+  // Stats become visible once meta arrives (~0.5s) — bundle count and policy
+  // count populate at different times during the stream.
+  const showStats = metaReady && !loadError;
   const totalBundles = bundles.length;
   const exportDisabled = exporting || !ready
     || exportable.length === 0 || questionCols.length === 0;
@@ -400,15 +779,26 @@ export default function App() {
               <div className="brand-sub">Pick policies · pick questions · one row per bundle</div>
             </div>
           </div>
-          <div className="masthead-stat">
-            <span className="stat-n">{ready ? fmtNumber(projectsWithBundles) : '—'}</span>
-            <span className="stat-l">projects</span>
-            <span className="dot">·</span>
-            <span className="stat-n">{ready ? fmtNumber(totalBundles) : '—'}</span>
-            <span className="stat-l">bundles</span>
-            <span className="dot">·</span>
-            <span className="stat-n">{ready ? fmtNumber(policies.length) : '—'}</span>
-            <span className="stat-l">policies</span>
+          <div className="masthead-right">
+            <div className="masthead-stat">
+              <span className="stat-n">{showStats ? fmtNumber(projectsWithBundles) : '—'}</span>
+              <span className="stat-l">projects</span>
+              <span className="dot">·</span>
+              <span className="stat-n">{showStats ? fmtNumber(totalBundles) : '—'}</span>
+              <span className="stat-l">bundles</span>
+              <span className="dot">·</span>
+              <span className="stat-n">{policiesReady ? fmtNumber(policies.length) : '—'}</span>
+              <span className="stat-l">policies</span>
+            </div>
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {theme === 'dark' ? '☀' : '☾'}
+            </button>
           </div>
         </div>
       </header>
@@ -424,6 +814,67 @@ export default function App() {
       )}
 
       <div className="filter-row">
+        <div className="filter-dropdowns">
+        <details className="proj-filter preset-menu">
+          <summary>
+            <span className="muted">Presets:</span>
+            <span className="filter-value">
+              {presets.length === 0 ? 'None saved' : `${fmtNumber(presets.length)} saved`}
+            </span>
+            <span className="caret">▾</span>
+          </summary>
+          <div className="proj-filter-body preset-body">
+            <div className="preset-save-row">
+              <input
+                className="search"
+                placeholder="Name this preset…"
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') saveCurrentPreset(); }}
+              />
+              <button className="ghost" onClick={saveCurrentPreset} disabled={!presetName.trim()}>
+                Save current
+              </button>
+            </div>
+            <div className="proj-filter-list">
+              {presets.length === 0 ? (
+                <div className="muted center small">No saved presets yet.</div>
+              ) : presets.map((p) => (
+                <div className="preset-line" key={p.name}>
+                  <button
+                    className="preset-apply"
+                    onClick={() => applyPreset(p)}
+                    title={`Apply preset — ${p.projectIds.length} project${p.projectIds.length === 1 ? '' : 's'}, ${p.artifactIds === null ? 'all' : p.artifactIds.length} question${p.artifactIds && p.artifactIds.length === 1 ? '' : 's'}`}
+                  >
+                    {p.name}
+                  </button>
+                  <span className="muted small">
+                    {p.projectIds.length || 'all'} proj · {p.artifactIds === null ? 'all' : p.artifactIds.length} q
+                  </span>
+                  <button
+                    className="ghost preset-delete"
+                    onClick={() => deletePreset(p.name)}
+                    title="Delete preset"
+                    aria-label={`Delete preset ${p.name}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="preset-foot">
+              {presetMsg && <span className="preset-msg muted small">{presetMsg}</span>}
+              <button
+                className="ghost"
+                onClick={clearAllPresets}
+                disabled={presets.length === 0}
+              >
+                Clear all
+              </button>
+            </div>
+          </div>
+        </details>
+
         <details className="proj-filter">
           <summary>
             <span className="muted">Projects:</span>
@@ -458,10 +909,13 @@ export default function App() {
             </div>
           </div>
         </details>
+        </div>
 
         <div className="filter-summary">
           <span className="muted">Selected:</span>
           <span><strong>{fmtNumber(selectedCount)}</strong> / {fmtNumber(totalQuestions)} question{totalQuestions === 1 ? '' : 's'}</span>
+          <span className="dot">·</span>
+          <span><strong>{fmtNumber(selectedPolicyCount)}</strong> / {fmtNumber(policies.length)} polic{policies.length === 1 ? 'y' : 'ies'}</span>
           <span className="dot">·</span>
           <span><strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'} in scope</span>
           <span className="filter-actions">
@@ -475,124 +929,54 @@ export default function App() {
       </div>
 
       <main className="policy-grid">
-        {loading ? (
-          <div className="policy-empty">Loading projects and bundles…</div>
+        {!policiesReady && !loadError ? (
+          <div className="policy-empty loading">
+            <span className="spin lg" />
+            <div className="loading-text">
+              {metaReady
+                ? `Loading policies… (${fmtNumber(totalBundles)} bundles found)`
+                : 'Loading projects and bundles…'}
+            </div>
+            <div className="loading-sub muted">
+              {metaReady ? 'Fetching policy definitions in parallel.' : ''}
+            </div>
+          </div>
         ) : policies.length === 0 ? (
           <div className="policy-empty">No accessible policies found.</div>
         ) : (
-          policies.map((policy) => {
-            const pState = policyState(policy);
-            const totalQ = artifactIdsForPolicy(policy).length;
-            const onCount = totalQ === 0
-              ? 0
-              : (selectedArtifactIds === null
+          policyColumns.map((col, colIdx) => (
+            <div key={colIdx} className="policy-col">
+              {col.map((policy) => {
+                const pState = policyState(policy);
+                const totalQ = artifactIdsForPolicy(policy).length;
+                const onCount = selectedArtifactIds === null
                   ? totalQ
-                  : artifactIdsForPolicy(policy).filter((id) => selectedArtifactIds.has(id)).length);
-            const collapsed = collapsedPolicies.has(policy.id);
-            return (
-              <section key={policy.id} className={`policy-card${pState === 'none' ? ' off' : ''}${collapsed ? ' collapsed' : ''}`}>
-                <header className="policy-card-head">
-                  <Tristate
-                    state={pState}
-                    onChange={(target) => setPolicySelection(policy, target)}
-                    ariaLabel={`Include policy ${policy.name}`}
-                    className="policy-master"
+                  : artifactIdsForPolicy(policy).filter((id) => selectedArtifactIds.has(id)).length;
+                const collapsed = collapsedPolicies.has(policy.id);
+                return (
+                  <PolicyCard
+                    key={policy.id}
+                    policy={policy}
+                    pState={pState}
+                    onCount={onCount}
+                    collapsed={collapsed}
+                    onToggleCollapsed={togglePolicyCollapsed}
+                    onSetPolicySelection={setPolicySelection}
+                    onSetSectionSelection={setSectionSelection}
+                    onToggleQuestion={toggleQuestion}
+                    selectedArtifactIds={selectedArtifactIds}
                   />
-                  <div className="policy-name" title={policy.name}>
-                    {policy.name}
-                    {policy.version && <span className="policy-version">v{policy.version}</span>}
-                  </div>
-                  <div className="policy-count">
-                    <span className={pState === 'some' ? 'emph' : ''}>{onCount}</span>
-                    <span>/{totalQ}</span>
-                  </div>
-                  <button
-                    type="button"
-                    className="policy-collapse"
-                    onClick={() => togglePolicyCollapsed(policy.id)}
-                    aria-label={collapsed ? `Expand ${policy.name}` : `Collapse ${policy.name}`}
-                    aria-expanded={!collapsed}
-                  >
-                    <span className="caret">▾</span>
-                  </button>
-                </header>
-                {!collapsed && <div className="policy-card-body">
-                  {policy.stages.map((stage, stageIdx) => (
-                    <div className="stage-card" key={stage.id || stageIdx}>
-                      <div className="stage-head">
-                        <span className="stage-label">STAGE {stageIdx + 1}</span>
-                        <span className="stage-name" title={stage.name}>{stage.name}</span>
-                      </div>
-                      <div className="stage-body">
-                        {stage.sections.map((sec, secIdx) => {
-                          const sState = sectionStateOf(sec);
-                          const total = sec.questions.length;
-                          const sOn = sState === 'all'
-                            ? total
-                            : (selectedArtifactIds === null
-                                ? total
-                                : sec.questions.filter((q) => selectedArtifactIds.has(q.id)).length);
-                          const cls = `section-card section-${sec.kind}${sState === 'none' ? ' off' : ''}`;
-                          return (
-                            <div className={cls} key={secIdx}>
-                              <div className="section-head">
-                                <Tristate
-                                  state={sState}
-                                  onChange={(target) => setSectionSelection(sec, target)}
-                                  ariaLabel={`Include section ${sec.name}`}
-                                  className="section-master"
-                                />
-                                {sec.kind === 'approval' && (
-                                  <span className="sec-kind sec-approval">Approval</span>
-                                )}
-                                <span className="section-name" title={sec.name}>{sec.name}</span>
-                                <span className="section-count">
-                                  <span className={sState === 'some' ? 'emph' : ''}>{sOn}</span>
-                                  <span>/{total}</span>
-                                </span>
-                              </div>
-                              <ul className="policy-q-list">
-                                {sec.questions.map((q) => (
-                                  <li
-                                    key={q.id}
-                                    className={`policy-q${q.isStatus ? ' status-q' : ''}`}
-                                  >
-                                    <label>
-                                      <input
-                                        type="checkbox"
-                                        checked={isQuestionSelected(q.id)}
-                                        onChange={() => toggleQuestion(q.id)}
-                                      />
-                                      <span className="policy-q-label" title={q.label}>{q.label}</span>
-                                    </label>
-                                  </li>
-                                ))}
-                              </ul>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-                  <div className="policy-card-foot muted small">
-                    {policy.bundleIds.size} bundle{policy.bundleIds.size === 1 ? '' : 's'}
-                  </div>
-                </div>}
-              </section>
-            );
-          })
+                );
+              })}
+            </div>
+          ))
         )}
       </main>
 
       <footer className="actionbar">
         <div className="actionbar-left">
           {exporting ? (
-            <div className="estimate">
-              <strong>{fmtNumber(progress.done)}</strong> / {fmtNumber(progress.total)} bundles processed
-              <div className="progress-bar">
-                <div className="progress-fill" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
-              </div>
-            </div>
+            <ExportProgress progress={progress} />
           ) : (
             <div className="estimate">
               Will export <strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'}
@@ -605,13 +989,16 @@ export default function App() {
           {lastExport && !exporting && (
             <div className="last-export muted">
               Saved <code>{lastExport.filename}</code> · {fmtNumber(lastExport.rows)} rows · {fmtNumber(lastExport.questions)} questions · {(lastExport.size / 1024).toFixed(1)} KB
+              {lastExport.failed > 0 && (
+                <> · <span className="warn">{fmtNumber(lastExport.failed)} failed (see <code>export_error</code> column)</span></>
+              )}
             </div>
           )}
           {exportError && <div className="banner-err small">{exportError}</div>}
         </div>
         <button className="primary" disabled={exportDisabled} onClick={handleExport}>
           {exporting ? (
-            <><span className="spin" /> Generating CSV…</>
+            <><span className="spin" /> {phaseLabel(progress.phase)}</>
           ) : (
             <>↓ Export governance evidence to CSV</>
           )}

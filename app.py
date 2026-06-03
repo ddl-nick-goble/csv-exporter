@@ -41,7 +41,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from requests.adapters import HTTPAdapter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -312,74 +312,112 @@ def health():
 
 @app.get("/api/load")
 def load():
-    """One-shot picker payload. Parallel-fetches projects + bundles, then
-    parallel-fetches every unique policy definition. No compute-policy on
-    the hot path."""
-    t0 = time.time()
-    try:
-        # projects + bundles in parallel — they're independent.
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_projects = ex.submit(_fetch_projects)
-            fut_bundles = ex.submit(_fetch_bundles)
-            projects = fut_projects.result()
-            bundles = fut_bundles.result()
-    except Exception as e:
-        log.exception("load: projects/bundles fetch failed")
-        return jsonify({"error": "load_failed", "detail": str(e)}), 502
+    """NDJSON stream. Phase 1 ('meta') sends projects + bundles as soon as
+    they're available so the UI can render stats and the project filter.
+    Phase 2 ('policies') sends the full policy definitions once the dedup
+    fan-out completes. Phase 3 ('done') terminates."""
+    def line(obj):
+        return json.dumps(obj, separators=(",", ":")) + "\n"
 
-    try:
-        policies = _fetch_policies_for_bundles(bundles)
-    except Exception as e:
-        log.exception("load: policies fetch failed")
-        return jsonify({"error": "policies_failed", "detail": str(e)}), 502
+    def gen():
+        t0 = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_projects = ex.submit(_fetch_projects)
+                fut_bundles = ex.submit(_fetch_bundles)
+                projects = fut_projects.result()
+                bundles = fut_bundles.result()
+        except Exception as e:
+            log.exception("load: projects/bundles fetch failed")
+            yield line({"type": "error", "stage": "meta", "detail": str(e)})
+            return
+        yield line({"type": "meta", "projects": projects, "bundles": bundles})
 
-    log.info("load: %d projects, %d bundles, %d policies in %.2fs",
-             len(projects), len(bundles), len(policies), time.time() - t0)
-    return jsonify({
-        "projects": projects,
-        "bundles": bundles,
-        "policies": policies,
+        try:
+            policies = _fetch_policies_for_bundles(bundles)
+        except Exception as e:
+            log.exception("load: policies fetch failed")
+            yield line({"type": "error", "stage": "policies", "detail": str(e)})
+            return
+        yield line({"type": "policies", "policies": policies})
+
+        log.info("load: %d projects, %d bundles, %d policies in %.2fs",
+                 len(projects), len(bundles), len(policies), time.time() - t0)
+        yield line({"type": "done"})
+
+    return Response(gen(), mimetype="application/x-ndjson", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     })
 
 
 @app.post("/api/evidence")
 def evidence():
-    """Fetch compute-policy payloads for the given bundle IDs. Used at export
-    time once the user has chosen which bundles to include."""
+    """NDJSON stream of compute-policy payloads for the given bundle IDs.
+
+    Streams so the UI can show real per-bundle progress instead of a long
+    blocking wait. Each line is one of:
+        { type: "start",  total }
+        { type: "bundle", id, name, computedList }
+        { type: "error",  id, name, detail }     # one bundle failed; continue
+        { type: "done",   ok, failed, elapsed }
+    """
     body = request.get_json(silent=True) or {}
     ids = body.get("bundleIds") or []
     if not isinstance(ids, list):
         return jsonify({"error": "bundleIds must be a list"}), 400
-    if not ids:
-        return jsonify({"results": {}})
 
-    # We need bundle objects to know their attached policies — re-list and
-    # filter (cheap, one call), avoids needing the client to send back the
-    # full bundle each time.
-    try:
-        all_bundles = _fetch_bundles()
-    except Exception as e:
-        log.exception("evidence: bundles fetch failed")
-        return jsonify({"error": "bundles_failed", "detail": str(e)}), 502
+    def line(obj):
+        return json.dumps(obj, separators=(",", ":")) + "\n"
 
-    wanted = set(ids)
-    targets = [b for b in all_bundles if (b.get("id") or b.get("_id")) in wanted]
+    def gen():
+        if not ids:
+            yield line({"type": "start", "total": 0})
+            yield line({"type": "done", "ok": 0, "failed": 0, "elapsed": 0.0})
+            return
 
-    results = {}
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
-        futures = {ex.submit(_fetch_evidence_for_bundle, b): b for b in targets}
-        for f in as_completed(futures):
-            b = futures[f]
-            try:
-                bid, computed_list = f.result()
-            except Exception as e:
-                log.warning("evidence fetch failed for bundle %s: %s", b.get("id"), e)
-                continue
-            if bid:
-                results[bid] = computed_list
-    log.info("evidence: %d/%d bundles in %.2fs", len(results), len(ids), time.time() - t0)
-    return jsonify({"results": results})
+        # Re-list bundles to learn each bundle's attached policies. Cheap
+        # (one upstream call) and avoids needing the client to round-trip
+        # the full bundle objects.
+        try:
+            all_bundles = _fetch_bundles()
+        except Exception as e:
+            log.exception("evidence: bundles fetch failed")
+            yield line({"type": "error", "stage": "bundles", "detail": str(e)})
+            return
+
+        wanted = set(ids)
+        targets = [b for b in all_bundles if (b.get("id") or b.get("_id")) in wanted]
+        yield line({"type": "start", "total": len(targets)})
+
+        ok = 0
+        failed = 0
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+            futures = {ex.submit(_fetch_evidence_for_bundle, b): b for b in targets}
+            for f in as_completed(futures):
+                b = futures[f]
+                bid = b.get("id") or b.get("_id") or ""
+                name = b.get("name") or ""
+                try:
+                    rid, computed_list = f.result()
+                except Exception as e:
+                    failed += 1
+                    log.warning("evidence fetch failed for bundle %s: %s", bid, e)
+                    yield line({"type": "error", "id": bid, "name": name, "detail": str(e)})
+                    continue
+                ok += 1
+                yield line({"type": "bundle", "id": rid or bid, "name": name,
+                            "computedList": computed_list})
+
+        elapsed = time.time() - t0
+        log.info("evidence: ok=%d failed=%d of %d in %.2fs", ok, failed, len(targets), elapsed)
+        yield line({"type": "done", "ok": ok, "failed": failed, "elapsed": elapsed})
+
+    return Response(gen(), mimetype="application/x-ndjson", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
 
 
 # ── Static React bundle ──────────────────────────────────────────────────────

@@ -29,7 +29,47 @@
   --err: #cf222e;
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
   --radius: 3px;
+
+  /* Banner colors are theme-specific (the light pinks don't read on dark);
+   * exposed as tokens so the dark block can override without forking rules. */
+  --err-border: #ffd1d1;
+  --err-bg: #fff5f5;
+  --err-text: #6a1212;
 }
+
+/* Dark theme overrides. Applied via the inline boot script in index.html
+ * (data-theme="dark" on <html>) so there's no flash of light on load. */
+:root[data-theme="dark"] {
+  --bg: #0b0f17;
+  --bg-2: #111827;
+  --panel: #131a26;
+  --border: #1f2937;
+  --border-2: #374151;
+
+  --text-strong: #f9fafb;
+  --text: #d1d5db;
+  --muted: #9ca3af;
+  --muted-2: #6b7280;
+
+  /* Brighter accent so it remains legible on dark surfaces. */
+  --accent: #3b82f6;
+  --accent-2: #60a5fa;
+  --accent-soft: rgba(59, 130, 246, 0.18);
+  --accent-tint: rgba(59, 130, 246, 0.15);
+
+  --good: #4ade80;
+  --good-2: #86efac;
+  --good-soft: rgba(74, 222, 128, 0.12);
+  --warn: #fbbf24;
+  --err: #f87171;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+
+  --err-border: #4c1d1d;
+  --err-bg: #2a1414;
+  --err-text: #fecaca;
+}
+
+html, body { background: var(--bg); color: var(--text); }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
@@ -77,6 +117,27 @@ button { font-family: inherit; cursor: pointer; }
 }
 .brand-sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
 
+.masthead-right {
+  display: flex; align-items: center; gap: 16px;
+}
+
+.theme-toggle {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1;
+  transition: border-color 0.12s, background 0.12s;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.theme-toggle:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+
 .masthead-stat {
   display: flex; align-items: baseline; gap: 8px;
   color: var(--muted); font-size: 12px;
@@ -94,7 +155,7 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: var(--radius);
 }
 .banner-err {
-  border-color: #ffd1d1; background: #fff5f5; color: #6a1212;
+  border-color: var(--err-border); background: var(--err-bg); color: var(--err-text);
 }
 .banner-err.small { padding: 8px 12px; font-size: 12px; }
 .banner code { background: rgba(0,0,0,0.05); padding: 1px 5px; border-radius: var(--radius); }
@@ -109,6 +170,9 @@ button { font-family: inherit; cursor: pointer; }
   gap: 16px; flex-wrap: wrap;
   padding: 0;
 }
+/* Cluster the dropdowns on the left with a tight gap; .filter-summary
+ * naturally takes the right side via the parent's space-between. */
+.filter-dropdowns { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 .proj-filter { position: relative; }
 .proj-filter summary {
@@ -176,22 +240,21 @@ button { font-family: inherit; cursor: pointer; }
   margin: 0 2px;
 }
 
-/* ── Policy grid (CSS columns → masonry-style stacking) ─────────────────── */
+/* ── Policy grid ─────────────────────────────────────────────────────────── */
 .policy-grid {
-  column-count: 3;
-  column-gap: 12px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
 }
-.policy-grid > * {
-  break-inside: avoid;
-  -webkit-column-break-inside: avoid;
-  page-break-inside: avoid;
-  margin-bottom: 12px;
-  display: inline-block;
-  width: 100%;
+.policy-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .policy-empty {
-  column-span: all;
-  -webkit-column-span: all;
+  flex: 1;
   text-align: center; color: var(--muted);
   padding: 48px 20px;
   border: 1px dashed var(--border);
@@ -477,6 +540,38 @@ button { font-family: inherit; cursor: pointer; }
   height: 100%;
   background: var(--accent);
   transition: width 0.18s ease;
+  /* Subtle moving stripes so the user sees the bar is "alive" even between
+   * incremental width updates. Goes solid once we hit the download phase. */
+  background-image: linear-gradient(
+    45deg,
+    rgba(255,255,255,0.18) 25%, transparent 25%,
+    transparent 50%, rgba(255,255,255,0.18) 50%,
+    rgba(255,255,255,0.18) 75%, transparent 75%, transparent
+  );
+  background-size: 16px 16px;
+  animation: progress-stripes 0.9s linear infinite;
+}
+.progress-fill.done {
+  animation: none;
+  background-image: none;
+  background-color: var(--good);
+}
+@keyframes progress-stripes {
+  from { background-position: 0 0; }
+  to   { background-position: 16px 0; }
+}
+
+/* Multi-line export progress panel */
+.export-progress { display: flex; flex-direction: column; gap: 4px; }
+.export-progress-line {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  font-size: 12.5px;
+}
+.export-phase { font-weight: 600; color: var(--text-strong); }
+.export-current {
+  font-style: italic;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 360px;
 }
 
 .primary {
@@ -516,15 +611,71 @@ button { font-family: inherit; cursor: pointer; }
   border-color: var(--border); border-top-color: var(--accent);
   margin-right: 4px;
 }
+.spin.lg {
+  width: 36px; height: 36px; border-width: 3px;
+  border-color: var(--border); border-top-color: var(--accent);
+  margin: 0 auto 16px;
+}
 .probing { color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Loading state in the policy grid: centered spinner with progressive text. */
+.policy-empty.loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+  padding: 64px 20px;
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+.policy-empty.loading .loading-text {
+  font-size: 14px; color: var(--text);
+  margin-top: 4px;
+}
+.policy-empty.loading .loading-sub {
+  font-size: 12px; margin-top: 6px;
+}
+@keyframes pulse-glow {
+  0%, 100% { border-color: var(--border); }
+  50% { border-color: var(--accent); }
+}
+
+/* Presets dropdown — reuses .proj-filter layout, with extra rows underneath. */
+.preset-menu .preset-body { min-width: 260px; }
+.preset-save-row {
+  display: flex; gap: 6px; padding: 8px 8px 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.preset-save-row .search { flex: 1; }
+.preset-line {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px;
+}
+.preset-line:hover { background: var(--panel-2, rgba(255,255,255,0.04)); }
+.preset-apply {
+  flex: 1; text-align: left;
+  background: transparent; border: none; color: var(--text);
+  padding: 4px 6px; border-radius: var(--radius); cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.preset-apply:hover { background: var(--panel-3, rgba(255,255,255,0.06)); }
+.preset-delete {
+  padding: 2px 8px; font-size: 14px; line-height: 1;
+}
+.preset-foot {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; padding: 8px; border-top: 1px solid var(--border);
+}
+.preset-msg { font-style: italic; }
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media (max-width: 880px) {
-  .policy-grid { column-count: 2; }
+  .policy-grid { gap: 8px; }
 }
 @media (max-width: 600px) {
-  .policy-grid { column-count: 1; }
+  .policy-grid { flex-direction: column; }
   .filter-row { flex-direction: column; align-items: stretch; }
   .actionbar { flex-direction: column; align-items: stretch; gap: 10px; }
   .primary { width: 100%; justify-content: center; }
