@@ -377,19 +377,20 @@ button { font-family: inherit; cursor: pointer; }
   background: var(--panel);
 }
 
-/* ── Stage card (nested inside policy card) ──────────────────────────────── */
-/* No background fill — separation comes from a single bottom rule on the
- * stage head and a thin border on the stage card itself. */
+/* ── Stage section (flat — no container box) ──────────────────────────────── */
+/* No border, no background, no radius. The stage is a logical grouping
+ * inside the bundle card: a STAGE N badge + stage name, a hairline rule,
+ * then question rows flow directly. */
 .stage-card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  display: flex; flex-direction: column; gap: 6px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  display: flex; flex-direction: column; gap: 4px;
 }
 .stage-head {
   display: flex; align-items: center; gap: 8px;
-  padding-bottom: 6px;
+  padding: 4px 0 6px;
   border-bottom: 1px solid var(--border);
 }
 .stage-name {
@@ -398,25 +399,30 @@ button { font-family: inherit; cursor: pointer; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .stage-body {
-  display: flex; flex-direction: column; gap: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  padding-top: 2px;
 }
 
-/* ── Section card (nested inside stage card) ─────────────────────────────── */
-/* No border, no background — just spacing. Sections inherit the stage
- * card's container. This is the layer where nesting was getting noisy. */
+/* ── Section (Evidence / Approval) — flat ────────────────────────────────── */
+/* No border, no background, no radius. Sections become small headings
+ * directly above the question list. */
 .section-card {
   background: transparent;
   border: none;
   border-radius: 0;
-  padding: 4px 0 4px 4px;
-  display: flex; flex-direction: column; gap: 2px;
+  padding: 0;
+  display: flex; flex-direction: column; gap: 0;
   position: relative;
 }
-/* The approval block keeps its identity through a single 3px left accent
- * stripe — no filled box, no bordered card, no contrast change. */
-.section-card.section-approval {
-  padding-left: 10px;
-  box-shadow: inset 3px 0 0 var(--good);
+/* Approval blocks signal their identity through:
+ *   - the small "Approval" chip in .section-head (existing),
+ *   - a 2px green border-left ON THE HEAD ROW ONLY (not the whole section),
+ * which keeps the visual weight on the heading and lets the question rows
+ * align flush with everything else. */
+.section-card.section-approval .section-head {
+  border-left: 2px solid var(--good);
+  padding-left: 6px;
+  margin-left: -6px;
 }
 .section-card.off { opacity: 0.55; }
 .section-card.off:hover { opacity: 0.85; }
@@ -511,6 +517,8 @@ button { font-family: inherit; cursor: pointer; }
 .warn { color: var(--warn); }
 
 /* ── Action bar ───────────────────────────────────────────────────────────── */
+/* Drop shadows are reserved for real overlays (the project + presets
+ * dropdown panels). Everything else relies on borders for separation. */
 .actionbar {
   position: fixed; left: 0; right: 0; bottom: 0;
   background: var(--panel);
@@ -518,7 +526,6 @@ button { font-family: inherit; cursor: pointer; }
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
   z-index: 100;
   border-top: 1px solid var(--border);
-  box-shadow: 0 -1px 2px rgba(15, 23, 42, 0.04);
 }
 .actionbar-left { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .estimate { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }

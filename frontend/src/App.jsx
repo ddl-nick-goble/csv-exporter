@@ -430,16 +430,37 @@ export default function App() {
     return cols;
   }, [policies, numCols]);
 
+  // policyArtifactIds and effectiveBundles must be available to every other
+  // bundle-derived memo below. Defined here so the bundle counts in the
+  // masthead, project filter, and exportable scope all share one base set.
+  const policyArtifactIds = useMemo(() => {
+    const m = new Map();
+    for (const p of policies) m.set(p.id, new Set(artifactIdsForPolicy(p)));
+    return m;
+  }, [policies]);
+
+  const effectiveBundles = useMemo(() => {
+    if (!policiesReady) return bundles;
+    if (policyArtifactIds.size === 0) return [];
+    return bundles.filter((b) => {
+      const refs = (b.policies && b.policies.length)
+        ? b.policies
+        : (b.policyId ? [{ policyId: b.policyId }] : []);
+      for (const r of refs) if (r && policyArtifactIds.has(r.policyId)) return true;
+      return false;
+    });
+  }, [bundles, policyArtifactIds, policiesReady]);
+
   const { bundleCountByProject, projectsWithBundles } = useMemo(() => {
     const byProj = new Map();
-    for (const b of bundles) {
+    for (const b of effectiveBundles) {
       const pid = b.projectId || (b.project && b.project.id) || '';
       byProj.set(pid, (byProj.get(pid) || 0) + 1);
     }
     let withBundles = 0;
     for (const count of byProj.values()) if (count > 0) withBundles++;
     return { bundleCountByProject: byProj, projectsWithBundles: withBundles };
-  }, [bundles]);
+  }, [effectiveBundles]);
 
   const enrichedProjects = useMemo(() =>
     projects.map((p) => ({
@@ -528,28 +549,18 @@ export default function App() {
 
   // ── Preflight ──────────────────────────────────────────────────────────────
   const projectMatchedBundles = useMemo(() => {
-    if (selectedProjectIds.size === 0) return bundles;
-    return bundles.filter((b) => {
+    if (selectedProjectIds.size === 0) return effectiveBundles;
+    return effectiveBundles.filter((b) => {
       const pid = b.projectId || (b.project && b.project.id) || '';
       return selectedProjectIds.has(pid);
     });
-  }, [bundles, selectedProjectIds]);
-
-  // For each policy, the set of bundle ids that reference it, and the set of
-  // its own artifact ids (questions + synthetic statuses). Used to compute
-  // "exportable" without per-bundle evidence — purely from the bundle ↔ policy
-  // references in the bundle list.
-  const policyArtifactIds = useMemo(() => {
-    const m = new Map();
-    for (const p of policies) m.set(p.id, new Set(artifactIdsForPolicy(p)));
-    return m;
-  }, [policies]);
+  }, [effectiveBundles, selectedProjectIds]);
 
   const bundlePolicyIds = useMemo(() => {
     // bundle.id -> Set<policyId> from the bundle's policies[] refs (or the
     // legacy top-level policyId).
     const m = new Map();
-    for (const b of bundles) {
+    for (const b of effectiveBundles) {
       const bid = b.id || b._id;
       if (!bid) continue;
       const set = new Set();
@@ -558,7 +569,7 @@ export default function App() {
       m.set(bid, set);
     }
     return m;
-  }, [bundles]);
+  }, [effectiveBundles]);
 
   // A bundle is exportable if any of its attached policies has at least one
   // selected question. Computed from the bundle ↔ policy ↔ question graph the
@@ -761,7 +772,11 @@ export default function App() {
   // Stats become visible once meta arrives (~0.5s) — bundle count and policy
   // count populate at different times during the stream.
   const showStats = metaReady && !loadError;
-  const totalBundles = bundles.length;
+  // Masthead bundle count must match the "in scope" denominator. Both use
+  // effectiveBundles, which equals bundles before policiesReady (so the
+  // "X bundles found" loading hint still shows the raw count) and the
+  // policy-viable subset after.
+  const totalBundles = effectiveBundles.length;
   const exportDisabled = exporting || !ready
     || exportable.length === 0 || questionCols.length === 0;
   const projectFilterLabel = selectedProjectIds.size === 0
