@@ -173,7 +173,7 @@ button { font-family: inherit; cursor: pointer; }
 
 /* ── Filter row (compact project picker + selection summary) ─────────────── */
 .filter-row {
-  display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap;
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
   padding: 0;
 }
 .filter-item {
@@ -349,6 +349,7 @@ button { font-family: inherit; cursor: pointer; }
 }
 .policy-card.off { opacity: 0.55; }
 .policy-card.off:hover { opacity: 0.85; }
+.policy-card.hidden { display: none; }
 .policy-card.off.empty:hover { opacity: 0.55; }
 .policy-card.empty .policy-master { cursor: not-allowed; }
 .policy-empty-note {

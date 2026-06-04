@@ -196,6 +196,7 @@ function policyCardPropsEqual(prev, next) {
     prev.pState === next.pState &&
     prev.onCount === next.onCount &&
     prev.collapsed === next.collapsed &&
+    prev.visible === next.visible &&
     prev.onToggleCollapsed === next.onToggleCollapsed &&
     prev.onSetPolicySelection === next.onSetPolicySelection &&
     prev.onSetSectionSelection === next.onSetSectionSelection &&
@@ -204,7 +205,7 @@ function policyCardPropsEqual(prev, next) {
 }
 
 const PolicyCard = React.memo(function PolicyCard({
-  policy, pState, onCount, collapsed,
+  policy, pState, onCount, collapsed, visible,
   onToggleCollapsed, onSetPolicySelection, onSetSectionSelection, onToggleQuestion,
   selectedArtifactIds,
 }) {
@@ -220,7 +221,7 @@ const PolicyCard = React.memo(function PolicyCard({
     return 'some';
   };
   return (
-    <section className={`policy-card${pState === 'none' ? ' off' : ''}${isEmpty ? ' empty' : ''}${collapsed ? ' collapsed' : ''}`}>
+    <section className={`policy-card${pState === 'none' ? ' off' : ''}${isEmpty ? ' empty' : ''}${collapsed ? ' collapsed' : ''}${!visible ? ' hidden' : ''}`}>
       <header className="policy-card-head">
         <Tristate
           state={pState}
@@ -498,25 +499,31 @@ export default function App() {
   const allArtifactIdsRef = useRef([]);
   useMemo(() => { allArtifactIdsRef.current = flattenArtifactIds(policies); }, [policies]);
 
-  // Distribute policies into columns round-robin so cards never reorder when
-  // a card is expanded — each card stays in its assigned column forever.
-  // Column assignment uses the policy's position in the FULL policies array so
-  // toggling the status filter never moves a card to a different column (which
-  // would unmount/remount it and all its children).
-  // statusFilter is a display-only filter; selection/export counts ignore it.
+  // Distribute ALL policies into columns round-robin — no filtering here.
+  // Visibility is handled via visiblePolicyIds (CSS display:none on the card)
+  // so toggling any filter never unmounts/remounts card trees full of question
+  // nodes. Only recomputes when the policy list or column count changes.
   const policyColumns = useMemo(() => {
+    const cols = Array.from({ length: numCols }, () => []);
+    policies.forEach((p, i) => cols[i % numCols].push(p));
+    return cols;
+  }, [policies, numCols]);
+
+  // Combined visibility predicate for all filters. Cheap Set lookup used by
+  // both the masthead counter and the per-card visible prop.
+  const visiblePolicyIds = useMemo(() => {
     const allStatuses = ['draft', 'published', 'archived'];
     const allSelected = allStatuses.every((s) => statusFilter.has(s));
-    const cols = Array.from({ length: numCols }, () => []);
-    policies.forEach((p, i) => {
-      if (allSelected || statusFilter.has(p.status)) {
-        if ((showUnused || p.bundleIds.size > 0) && (showEmpty || p.stages.length > 0)) {
-          cols[i % numCols].push(p);
-        }
+    const ids = new Set();
+    for (const p of policies) {
+      if ((allSelected || statusFilter.has(p.status)) &&
+          (showUnused || p.bundleIds.size > 0) &&
+          (showEmpty || p.stages.length > 0)) {
+        ids.add(p.id);
       }
-    });
-    return cols;
-  }, [policies, numCols, statusFilter, showUnused, showEmpty]);
+    }
+    return ids;
+  }, [policies, statusFilter, showUnused, showEmpty]);
 
   const unusedCount = useMemo(
     () => policies.filter((p) => p.bundleIds.size === 0).length,
@@ -912,9 +919,9 @@ export default function App() {
               <span className="stat-n">{showStats ? fmtNumber(totalBundles) : '—'}</span>
               <span className="stat-l">bundles</span>
               <span className="dot">·</span>
-              {policiesReady && (!['draft','published','archived'].every(s => statusFilter.has(s)) || !showUnused || !showEmpty) ? (
+              {policiesReady && visiblePolicyIds.size !== policies.length ? (
                 <>
-                  <span className="stat-n">{fmtNumber(policyColumns.reduce((s, c) => s + c.length, 0))}</span>
+                  <span className="stat-n">{fmtNumber(visiblePolicyIds.size)}</span>
                   <span className="stat-l muted-2">/</span>
                   <span className="stat-n">{fmtNumber(policies.length)}</span>
                 </>
@@ -1141,6 +1148,7 @@ export default function App() {
                     pState={pState}
                     onCount={onCount}
                     collapsed={collapsed}
+                    visible={visiblePolicyIds.has(policy.id)}
                     onToggleCollapsed={togglePolicyCollapsed}
                     onSetPolicySelection={setPolicySelection}
                     onSetSectionSelection={setSectionSelection}
