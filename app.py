@@ -50,14 +50,20 @@ DIST = os.path.join(HERE, "frontend", "dist")
 API_PROXY = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899").rstrip("/")
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
 FETCH_CONCURRENCY = int(os.environ.get("FETCH_CONCURRENCY", "25"))
+# Multi-policy bundles fan out per-policy compute calls inside a worker
+# (see _fetch_evidence_for_bundle), so the pool needs headroom beyond the
+# top-level worker count or urllib3 will spam "pool is full" warnings and
+# discard connections (each discarded conn = a fresh TLS handshake).
+INNER_FANOUT = int(os.environ.get("INNER_FANOUT", "4"))
+_POOL_SIZE = max(FETCH_CONCURRENCY * INNER_FANOUT, 64)
 
-# Shared session: keep-alive + a connection pool sized to FETCH_CONCURRENCY
-# saves a TLS handshake per upstream call (the single biggest win when
-# fanning out hundreds of small GETs to the same host).
+# Shared session: keep-alive + a connection pool sized to the worst-case
+# concurrent in-flight upstream calls. Saves a TLS handshake per call (the
+# single biggest win when fanning out hundreds of small GETs to one host).
 _session = requests.Session()
 _adapter = HTTPAdapter(
-    pool_connections=FETCH_CONCURRENCY,
-    pool_maxsize=FETCH_CONCURRENCY,
+    pool_connections=4,        # number of distinct host pools we cache
+    pool_maxsize=_POOL_SIZE,   # connections per host pool
     pool_block=False,
 )
 _session.mount("http://", _adapter)
@@ -290,7 +296,7 @@ def _fetch_evidence_for_bundle(bundle):
         if payload:
             out.append(payload)
     else:
-        with ThreadPoolExecutor(max_workers=min(len(refs), 4)) as ex:
+        with ThreadPoolExecutor(max_workers=min(len(refs), INNER_FANOUT)) as ex:
             futs = [ex.submit(_compute_policy, bid, r["policyId"], r.get("policyVersionId")) for r in refs]
             for f in futs:
                 try:
@@ -351,48 +357,72 @@ def load():
     })
 
 
+EVIDENCE_BATCH_SIZE = int(os.environ.get("EVIDENCE_BATCH_SIZE", "10"))
+EVIDENCE_BATCH_MAX_WAIT = float(os.environ.get("EVIDENCE_BATCH_MAX_WAIT", "0.5"))
+
+
 @app.post("/api/evidence")
 def evidence():
     """NDJSON stream of compute-policy payloads for the given bundle IDs.
 
-    Streams so the UI can show real per-bundle progress instead of a long
-    blocking wait. Each line is one of:
-        { type: "start",  total }
-        { type: "bundle", id, name, computedList }
-        { type: "error",  id, name, detail }     # one bundle failed; continue
-        { type: "done",   ok, failed, elapsed }
+    Streams in *batches* so the UI sees real progress while still pushing
+    large-enough chunks to defeat proxy/transport buffering. Without
+    batching, a hundred ~1KB lines often get buffered into one chunk at
+    the proxy and the UI sits at 0% until everything arrives at once.
+
+    Lines emitted:
+        { type: "start",   total }
+        { type: "batch",   bundles: [{ id, name, computedList } | { id, name, error }, ...] }
+        { type: "done",    ok, failed, elapsed }
+        { type: "error",   stage, detail }   # fatal — whole stream aborts
     """
     body = request.get_json(silent=True) or {}
     ids = body.get("bundleIds") or []
     if not isinstance(ids, list):
         return jsonify({"error": "bundleIds must be a list"}), 400
 
-    def line(obj):
-        return json.dumps(obj, separators=(",", ":")) + "\n"
+    # SSE frames are `event: <type>\ndata: <json>\n\n`. Using text/event-stream
+    # (not NDJSON) so proxies don't buffer — almost every proxy treats SSE as
+    # streaming-by-default, even ones that ignore `X-Accel-Buffering`.
+    def sse(event, data):
+        return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
     def gen():
+        # Primer: SSE comment line (~2KB). Comments in SSE start with ":".
+        # Some proxies buffer the first few KB; this forces an early flush.
+        yield ": " + ("primer " * 256) + "\n\n"
+
         if not ids:
-            yield line({"type": "start", "total": 0})
-            yield line({"type": "done", "ok": 0, "failed": 0, "elapsed": 0.0})
+            yield sse("start", {"total": 0})
+            yield sse("done", {"ok": 0, "failed": 0, "elapsed": 0.0})
             return
 
-        # Re-list bundles to learn each bundle's attached policies. Cheap
-        # (one upstream call) and avoids needing the client to round-trip
-        # the full bundle objects.
         try:
             all_bundles = _fetch_bundles()
         except Exception as e:
             log.exception("evidence: bundles fetch failed")
-            yield line({"type": "error", "stage": "bundles", "detail": str(e)})
+            yield sse("error", {"stage": "bundles", "detail": str(e)})
             return
 
         wanted = set(ids)
         targets = [b for b in all_bundles if (b.get("id") or b.get("_id")) in wanted]
-        yield line({"type": "start", "total": len(targets)})
+        yield sse("start", {"total": len(targets)})
 
         ok = 0
         failed = 0
         t0 = time.time()
+        batch = []
+        last_flush = time.time()
+
+        def flush_batch():
+            nonlocal batch, last_flush
+            if not batch:
+                return None
+            payload = sse("batch", {"bundles": batch})
+            batch = []
+            last_flush = time.time()
+            return payload
+
         with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
             futures = {ex.submit(_fetch_evidence_for_bundle, b): b for b in targets}
             for f in as_completed(futures):
@@ -401,22 +431,36 @@ def evidence():
                 name = b.get("name") or ""
                 try:
                     rid, computed_list = f.result()
+                    ok += 1
+                    batch.append({"id": rid or bid, "name": name,
+                                  "computedList": computed_list})
                 except Exception as e:
                     failed += 1
                     log.warning("evidence fetch failed for bundle %s: %s", bid, e)
-                    yield line({"type": "error", "id": bid, "name": name, "detail": str(e)})
-                    continue
-                ok += 1
-                yield line({"type": "bundle", "id": rid or bid, "name": name,
-                            "computedList": computed_list})
+                    batch.append({"id": bid, "name": name, "error": str(e)})
+
+                # Flush on size OR wall-clock so we keep the UI moving even
+                # when individual bundles arrive slowly.
+                if len(batch) >= EVIDENCE_BATCH_SIZE \
+                   or (time.time() - last_flush) >= EVIDENCE_BATCH_MAX_WAIT:
+                    out = flush_batch()
+                    if out:
+                        yield out
+
+        # Drain anything left in the in-flight batch.
+        out = flush_batch()
+        if out:
+            yield out
 
         elapsed = time.time() - t0
         log.info("evidence: ok=%d failed=%d of %d in %.2fs", ok, failed, len(targets), elapsed)
-        yield line({"type": "done", "ok": ok, "failed": failed, "elapsed": elapsed})
+        yield sse("done", {"ok": ok, "failed": failed, "elapsed": elapsed})
 
-    return Response(gen(), mimetype="application/x-ndjson", headers={
-        "Cache-Control": "no-cache",
+    return Response(gen(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",
+        "Content-Encoding": "identity",
+        "Connection": "keep-alive",
     })
 
 
@@ -436,7 +480,8 @@ def static_proxy(path):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8888"))
-    log.info("serving on 0.0.0.0:%d", port)
+    log.info("serving on 0.0.0.0:%d (FETCH_CONCURRENCY=%d, INNER_FANOUT=%d, pool_maxsize=%d)",
+             port, FETCH_CONCURRENCY, INNER_FANOUT, _POOL_SIZE)
     if not os.path.isdir(DIST):
         log.warning("frontend/dist/ not found — run `npm run build` in frontend/ first.")
     app.run(host="0.0.0.0", port=port, threaded=True)

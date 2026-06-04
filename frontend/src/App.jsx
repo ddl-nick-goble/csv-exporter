@@ -80,14 +80,31 @@ function fmtDuration(ms) {
   return `${m}m ${s - m * 60}s`;
 }
 
-// Detailed export status panel — phase label, X/N, percentage, throughput,
-// ETA, and the most-recent bundle name so the user can see things move.
+// Detailed export status panel. Three visual tricks make this feel alive
+// even when the network is slow or the proxy buffers:
+//   1. The progress bar always shows moving diagonal stripes (via CSS), so
+//      the user gets motion regardless of width changes.
+//   2. When done === 0 we show an "indeterminate" sweep instead of a 0%-
+//      wide bar — a clear "working" signal before the first batch lands.
+//   3. The elapsed clock ticks every animation frame, so even with no
+//      server-side updates the user sees the time moving forward.
 function ExportProgress({ progress }) {
   const { phase = 'fetching', done = 0, total = 0, failed = 0, currentName = '', startedAt = 0 } = progress;
+  // Tick state at ~10fps so the elapsed clock and the indeterminate sweep
+  // stay live even between server events.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    let id;
+    const loop = () => { setTick((n) => n + 1); id = setTimeout(loop, 100); };
+    id = setTimeout(loop, 100);
+    return () => clearTimeout(id);
+  }, []);
+
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const elapsed = startedAt ? Date.now() - startedAt : 0;
   const rate = elapsed > 250 && done > 0 ? done / (elapsed / 1000) : 0;
   const remaining = rate > 0 && total > done ? (total - done) / rate * 1000 : 0;
+  const indeterminate = done === 0 && phase === 'fetching';
   return (
     <div className="estimate export-progress">
       <div className="export-progress-line">
@@ -100,6 +117,8 @@ function ExportProgress({ progress }) {
           <span className="dot">·</span>
           <span className="warn">{fmtNumber(failed)} failed</span>
         </>}
+        <span className="dot">·</span>
+        <span className="muted">{fmtDuration(elapsed)} elapsed</span>
         {rate > 0 && phase === 'fetching' && <>
           <span className="dot">·</span>
           <span className="muted">{rate.toFixed(1)}/s</span>
@@ -109,11 +128,16 @@ function ExportProgress({ progress }) {
           </>}
         </>}
       </div>
-      <div className="progress-bar">
-        <div className={`progress-fill${phase === 'downloading' ? ' done' : ''}`} style={{ width: `${pct}%` }} />
+      <div className={`progress-bar${indeterminate ? ' indeterminate' : ''}`}>
+        <div
+          className={`progress-fill${phase === 'downloading' ? ' done' : ''}`}
+          style={indeterminate ? undefined : { width: `${pct}%` }}
+        />
       </div>
-      {currentName && phase === 'fetching' && (
-        <div className="export-current muted small" title={currentName}>{currentName}</div>
+      {phase === 'fetching' && (
+        <div className="export-current muted small" title={currentName || ''}>
+          {currentName ? currentName : (indeterminate ? 'Waiting for server…' : ' ')}
+        </div>
       )}
     </div>
   );
@@ -927,12 +951,6 @@ export default function App() {
         </div>
 
         <div className="filter-summary">
-          <span className="muted">Selected:</span>
-          <span><strong>{fmtNumber(selectedCount)}</strong> / {fmtNumber(totalQuestions)} question{totalQuestions === 1 ? '' : 's'}</span>
-          <span className="dot">·</span>
-          <span><strong>{fmtNumber(selectedPolicyCount)}</strong> / {fmtNumber(policies.length)} polic{policies.length === 1 ? 'y' : 'ies'}</span>
-          <span className="dot">·</span>
-          <span><strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'} in scope</span>
           <span className="filter-actions">
             <button className="ghost" onClick={() => setAllQuestions('all')} disabled={selectedCount === totalQuestions}>Select all</button>
             <button className="ghost" onClick={() => setAllQuestions('none')} disabled={selectedCount === 0}>Clear</button>
@@ -994,11 +1012,11 @@ export default function App() {
             <ExportProgress progress={progress} />
           ) : (
             <div className="estimate">
-              Will export <strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'}
+              <span><strong>{fmtNumber(selectedCount)}</strong> / {fmtNumber(totalQuestions)} question{totalQuestions === 1 ? '' : 's'}</span>
               {' '}·{' '}
-              <strong>{fmtNumber(questionCols.length)}</strong> question column{questionCols.length === 1 ? '' : 's'}
+              <span><strong>{fmtNumber(selectedPolicyCount)}</strong> / {fmtNumber(policies.length)} polic{policies.length === 1 ? 'y' : 'ies'}</span>
               {' '}·{' '}
-              <strong>{META_COLUMNS.length}</strong> metadata columns
+              <span><strong>{fmtNumber(exportable.length)}</strong> bundle{exportable.length === 1 ? '' : 's'} in scope</span>
             </div>
           )}
           {lastExport && !exporting && (

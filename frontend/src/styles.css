@@ -568,6 +568,25 @@ button { font-family: inherit; cursor: pointer; }
   to   { background-position: 16px 0; }
 }
 
+/* Indeterminate state — used before the first batch arrives. The bar wraps a
+ * sweeping pill so the user sees clear motion even with zero data. */
+.progress-bar.indeterminate {
+  position: relative;
+  overflow: hidden;
+}
+.progress-bar.indeterminate .progress-fill {
+  width: 38% !important;
+  position: absolute; top: 0; bottom: 0;
+  animation:
+    progress-stripes 0.9s linear infinite,
+    progress-sweep 1.4s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+  transition: none;
+}
+@keyframes progress-sweep {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+
 /* Multi-line export progress panel */
 .export-progress { display: flex; flex-direction: column; gap: 4px; }
 .export-progress-line {
