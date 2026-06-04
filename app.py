@@ -89,7 +89,7 @@ def _ingress_host():
             return _host_cache["host"]
         host = os.environ.get("GOVERNANCE_INGRESS_HOST", "").rstrip("/")
         if not host:
-            r = requests.get(f"{API_PROXY}/cliSiteConfig", timeout=10)
+            r = _session.get(f"{API_PROXY}/cliSiteConfig", timeout=10)
             r.raise_for_status()
             host = str(r.json()["host"]).rstrip("/")
         _host_cache["host"] = host
@@ -119,7 +119,7 @@ def _bearer(force=False):
         now = time.time()
         if not force and _token_cache["token"] and now < _token_cache["exp"] - 30:
             return _token_cache["token"]
-        r = requests.get(f"{API_PROXY}/access-token", timeout=10)
+        r = _session.get(f"{API_PROXY}/access-token", timeout=10)
         r.raise_for_status()
         tok = r.text.strip()
         _token_cache["token"] = tok
@@ -326,7 +326,7 @@ def load():
         return json.dumps(obj, separators=(",", ":")) + "\n"
 
     def gen():
-        t0 = time.time()
+        t0 = time.monotonic()
         try:
             with ThreadPoolExecutor(max_workers=2) as ex:
                 fut_projects = ex.submit(_fetch_projects)
@@ -348,7 +348,7 @@ def load():
         yield line({"type": "policies", "policies": policies})
 
         log.info("load: %d projects, %d bundles, %d policies in %.2fs",
-                 len(projects), len(bundles), len(policies), time.time() - t0)
+                 len(projects), len(bundles), len(policies), time.monotonic() - t0)
         yield line({"type": "done"})
 
     return Response(gen(), mimetype="application/x-ndjson", headers={
@@ -410,9 +410,9 @@ def evidence():
 
         ok = 0
         failed = 0
-        t0 = time.time()
+        t0 = time.monotonic()
         batch = []
-        last_flush = time.time()
+        last_flush = time.monotonic()
 
         def flush_batch():
             nonlocal batch, last_flush
@@ -420,7 +420,7 @@ def evidence():
                 return None
             payload = sse("batch", {"bundles": batch})
             batch = []
-            last_flush = time.time()
+            last_flush = time.monotonic()
             return payload
 
         with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
@@ -442,7 +442,7 @@ def evidence():
                 # Flush on size OR wall-clock so we keep the UI moving even
                 # when individual bundles arrive slowly.
                 if len(batch) >= EVIDENCE_BATCH_SIZE \
-                   or (time.time() - last_flush) >= EVIDENCE_BATCH_MAX_WAIT:
+                   or (time.monotonic() - last_flush) >= EVIDENCE_BATCH_MAX_WAIT:
                     out = flush_batch()
                     if out:
                         yield out
@@ -452,7 +452,7 @@ def evidence():
         if out:
             yield out
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         log.info("evidence: ok=%d failed=%d of %d in %.2fs", ok, failed, len(targets), elapsed)
         yield sse("done", {"ok": ok, "failed": failed, "elapsed": elapsed})
 

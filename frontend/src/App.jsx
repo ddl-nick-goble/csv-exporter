@@ -322,7 +322,7 @@ export default function App() {
   const [loadError, setLoadError] = useState(null);
 
   // Evidence is fetched at export time only — see handleExport.
-  const probeCacheRef = useRef(new Map());
+  const evidenceCacheRef = useRef(new Map());
 
   // ── User selections ────────────────────────────────────────────────────────
   const [selectedProjectIds, setSelectedProjectIds] = useState(() => new Set());
@@ -413,7 +413,7 @@ export default function App() {
     setServerPolicies([]);
     setMetaReady(false);
     setPoliciesReady(false);
-    probeCacheRef.current = new Map();
+    evidenceCacheRef.current = new Map();
     load({
       onMeta: ({ projects, bundles }) => {
         if (cancelled) return;
@@ -685,7 +685,7 @@ export default function App() {
 
     try {
       const exportableIds = exportable.map((b) => b.id || b._id).filter(Boolean);
-      const idsToFetch = exportableIds.filter((id) => !probeCacheRef.current.has(id));
+      const idsToFetch = exportableIds.filter((id) => !evidenceCacheRef.current.has(id));
 
       if (idsToFetch.length) {
         let fetched = 0;
@@ -700,7 +700,7 @@ export default function App() {
             });
           },
           onBundle: ({ id, name, computedList }) => {
-            probeCacheRef.current.set(id, computedList || []);
+            evidenceCacheRef.current.set(id, computedList || []);
             fetched++;
             scheduleProgress({
               phase: 'fetching', done: fetched + failed, total, failed,
@@ -730,7 +730,7 @@ export default function App() {
       let lastTick = performance.now();
       for (const bundle of exportable) {
         const id = bundle.id || bundle._id;
-        const computedList = probeCacheRef.current.get(id) || [];
+        const computedList = evidenceCacheRef.current.get(id) || [];
         const failure = failures.get(id);
         const meta = {
           exported_at_utc: exportedAt,
