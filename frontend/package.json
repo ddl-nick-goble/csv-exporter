@@ -8,7 +8,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .js,.jsx",
+    "format": "prettier --write 'src/**/*.{js,jsx,css}'",
+    "format:check": "prettier --check 'src/**/*.{js,jsx,css}'"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -16,8 +19,12 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^8.57.1",
+    "eslint-plugin-react": "^7.37.2",
+    "eslint-plugin-react-hooks": "^4.6.2",
     "http-proxy": "^1.18.1",
     "jsdom": "^25.0.1",
+    "prettier": "^3.3.3",
     "vite": "^5.4.11",
     "vitest": "^2.1.4"
   }

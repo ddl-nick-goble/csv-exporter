@@ -210,7 +210,7 @@ describe('CsvBuilder', () => {
       answers: { a1: 'one\ntwo' },
     }]);
     // Strip the UTF-8 BOM that buildText prepends for Excel compatibility.
-    const [header, ...rest] = text.replace(/^﻿/, '').split('\n');
+    const [header, ...rest] = text.replace(/^\ufeff/, '').split('\n');
     expect(header).toBe('bundle_id,bundle_name,Policy: Purpose');
     expect(rest.join('\n')).toContain('"has, ""comma"""');
     expect(rest.join('\n')).toContain('"one\ntwo"');
@@ -219,7 +219,7 @@ describe('CsvBuilder', () => {
   it('falls back to label when no header is provided', () => {
     const builder = new CsvBuilder(['bundle_id'], [{ id: 'a1', label: 'Just Label' }]);
     const text = builder.buildText([{ meta: { bundle_id: 'b' }, answers: {} }]);
-    expect(text.replace(/^﻿/, '').split('\n')[0]).toBe('bundle_id,Just Label');
+    expect(text.replace(/^\ufeff/, '').split('\n')[0]).toBe('bundle_id,Just Label');
   });
 });
 
