@@ -63,13 +63,30 @@ bash dev.sh
 ```
 
 
+## Authentication
+
+The app talks to two Domino API surfaces, with two different auth schemes:
+
+| Surface | Header | Source |
+| --- | --- | --- |
+| Governance (`/api/governance/v1/*`) | `X-Domino-Api-Key: <key>` | `DOMINO_USER_API_KEY` (or `DOMINO_API_KEY`) env var |
+| Non-governance (e.g. `/v4/*`) | `Authorization: Bearer <jwt>` | `DOMINO_API_PROXY/access-token` |
+
+Inside any Domino workspace or app, `DOMINO_USER_API_KEY` is set automatically.
+For local development outside Domino, set one of `DOMINO_USER_API_KEY` /
+`DOMINO_API_KEY` to a valid Domino API key. The app logs at startup
+whether the key was found.
+
+
 ## Environment variables
 
 ### Runtime
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `8888` | Port Flask listens on. |
-| `DOMINO_API_PROXY` | `http://localhost:8899` | Local Domino API proxy. Used for `/access-token` and `/cliSiteConfig`. |
+| `DOMINO_USER_API_KEY` | _required_ | Domino user API key. Used as `X-Domino-Api-Key` for all governance calls. Auto-populated inside Domino workloads. |
+| `DOMINO_API_KEY` | _fallback_ | Used if `DOMINO_USER_API_KEY` is unset. |
+| `DOMINO_API_PROXY` | `http://localhost:8899` | Local Domino API proxy. Used for `/access-token` (non-gov bearer) and `/cliSiteConfig` (ingress host resolution). |
 | `GOVERNANCE_INGRESS_HOST` | _resolved_ | Override the public Domino host serving the governance API (auto-resolved from `/cliSiteConfig` when unset). |
 | `UPSTREAM_TIMEOUT` | `60` | Seconds before an upstream call to Domino aborts. |
 | `FETCH_CONCURRENCY` | `25` | Top-level worker pool for parallel upstream fetches (policies, evidence). |

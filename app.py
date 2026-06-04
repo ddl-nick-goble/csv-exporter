@@ -22,12 +22,17 @@ Auth + routing:
   Neither $DOMINO_API_PROXY (localhost:8899) nor the internal public-api host
   will serve it — both return 404 regardless of auth. The governance API *is*
   served by the public ingress host (from GET $DOMINO_API_PROXY/cliSiteConfig),
-  the same host the Domino UI talks to. It accepts a short-lived bearer token
-  from $DOMINO_API_PROXY/access-token. We resolve the host once, mint/refresh
-  the token as needed, and call upstream as this run's identity (the
-  workspace/app owner). /bundles already enforces per-user access — for
-  GovernanceAdmins it returns instance-wide bundles, for others it returns
-  only bundles whose project they can see.
+  the same host the Domino UI talks to.
+
+  Two auth surfaces, two schemes:
+    - governance: X-Domino-Api-Key, sourced from DOMINO_USER_API_KEY (set
+      automatically inside any Domino workspace/app). Stable, no expiry.
+    - non-governance (e.g. /v4/*): Authorization: Bearer <jwt> minted by
+      $DOMINO_API_PROXY/access-token. Short-lived; refreshed on 401.
+
+  /bundles already enforces per-user access — for GovernanceAdmins it
+  returns instance-wide bundles, for others it returns only bundles whose
+  project they can see.
 
 Static serving: anything that isn't /api/* is served from frontend/dist/
 (SPA fallback to index.html).
@@ -111,7 +116,11 @@ def _jwt_ttl(token, default):
 
 
 def _bearer(force=False):
-    """Return a valid bearer token, refreshing from the API proxy as needed."""
+    """Return a valid bearer token, refreshing from the API proxy as needed.
+
+    Only used for non-governance Domino endpoints (e.g. /v4/*). Governance
+    calls authenticate with the user's API key — see _api_key() / _domino().
+    """
     now = time.time()
     if not force and _token_cache["token"] and now < _token_cache["exp"] - 30:
         return _token_cache["token"]
@@ -127,26 +136,59 @@ def _bearer(force=False):
         return tok
 
 
+def _api_key():
+    """The user's Domino API key, used to authenticate governance calls.
+
+    Populated automatically by Domino in every workspace/app (DOMINO_USER_API_KEY).
+    Falls back to DOMINO_API_KEY for non-Domino environments. We don't cache:
+    reading os.environ is free, and avoiding a cache means rotation works
+    immediately on next request.
+    """
+    key = os.environ.get("DOMINO_USER_API_KEY") or os.environ.get("DOMINO_API_KEY") or ""
+    return key.strip()
+
+
+def _is_governance_path(path):
+    """Governance endpoints use a different auth surface than the public API:
+    X-Domino-Api-Key instead of the short-lived bearer from /access-token."""
+    return path.lstrip("/").startswith("api/governance/")
+
+
 def _domino(method, path, params=None, json_body=None):
-    """One upstream call with bearer auth and a single 401 retry."""
+    """One upstream call. Auth surface depends on the path:
+
+      - governance (`api/governance/v1/*`): X-Domino-Api-Key, no retry on 401
+        (a stale/missing key won't be fixed by retrying).
+      - everything else: Authorization: Bearer …, with one 401 retry that
+        force-refreshes the token (it may have expired between mint and use).
+    """
     host = _ingress_host()
     url = f"{host}/{path.lstrip('/')}"
+    is_gov = _is_governance_path(path)
 
     def call(force):
+        if is_gov:
+            headers = {
+                "Accept": "application/json",
+                "X-Domino-Api-Key": _api_key(),
+            }
+        else:
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {_bearer(force=force)}",
+            }
         return _session.request(
             method, url,
             params=params,
             json=json_body,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {_bearer(force=force)}",
-            },
+            headers=headers,
             timeout=UPSTREAM_TIMEOUT,
         )
 
     resp = call(force=False)
-    if resp.status_code == 401:
-        # Token may have expired between mint and use — refresh once, retry.
+    # Bearer can race against its own TTL; refresh-and-retry catches that.
+    # API keys don't expire — a 401 there is a real config problem; surface it.
+    if resp.status_code == 401 and not is_gov:
         resp = call(force=True)
     return resp
 
@@ -488,6 +530,11 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8888"))
     log.info("serving on 0.0.0.0:%d (FETCH_CONCURRENCY=%d, INNER_FANOUT=%d, pool_maxsize=%d)",
              port, FETCH_CONCURRENCY, INNER_FANOUT, _POOL_SIZE)
+    if _api_key():
+        log.info("governance auth: X-Domino-Api-Key from env (length=%d)", len(_api_key()))
+    else:
+        log.error("governance auth: DOMINO_USER_API_KEY / DOMINO_API_KEY not set — "
+                  "governance calls will 401")
     if not os.path.isdir(DIST):
         log.warning("frontend/dist/ not found — run `npm run build` in frontend/ first.")
     app.run(host="0.0.0.0", port=port, threaded=True)

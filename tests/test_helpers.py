@@ -124,6 +124,129 @@ class TestBundlePolicyRefs:
         assert app._bundle_policy_refs({}) == []
 
 
+# ── _api_key + governance routing ─────────────────────────────────────────────
+class TestApiKey:
+    def test_reads_domino_user_api_key(self, monkeypatch):
+        monkeypatch.setenv("DOMINO_USER_API_KEY", "user-key-123")
+        monkeypatch.delenv("DOMINO_API_KEY", raising=False)
+        assert app._api_key() == "user-key-123"
+
+    def test_falls_back_to_domino_api_key(self, monkeypatch):
+        monkeypatch.delenv("DOMINO_USER_API_KEY", raising=False)
+        monkeypatch.setenv("DOMINO_API_KEY", "generic-key-456")
+        assert app._api_key() == "generic-key-456"
+
+    def test_prefers_user_key_over_generic(self, monkeypatch):
+        monkeypatch.setenv("DOMINO_USER_API_KEY", "user-key")
+        monkeypatch.setenv("DOMINO_API_KEY", "generic-key")
+        assert app._api_key() == "user-key"
+
+    def test_strips_whitespace(self, monkeypatch):
+        monkeypatch.setenv("DOMINO_USER_API_KEY", "  padded-key  \n")
+        assert app._api_key() == "padded-key"
+
+    def test_returns_empty_when_unset(self, monkeypatch):
+        monkeypatch.delenv("DOMINO_USER_API_KEY", raising=False)
+        monkeypatch.delenv("DOMINO_API_KEY", raising=False)
+        assert app._api_key() == ""
+
+
+class TestIsGovernancePath:
+    def test_governance_paths_are_detected(self):
+        assert app._is_governance_path("api/governance/v1/bundles")
+        assert app._is_governance_path("/api/governance/v1/bundles")
+        assert app._is_governance_path("api/governance/v1/rpc/compute-policy")
+
+    def test_non_governance_paths_are_not_detected(self):
+        assert not app._is_governance_path("v4/projects")
+        assert not app._is_governance_path("/cliSiteConfig")
+        assert not app._is_governance_path("api/other/v1/thing")
+
+
+class TestDominoRouting:
+    """_domino() must pick the right auth header based on path:
+       - governance: X-Domino-Api-Key, no bearer mint, no 401 retry
+       - non-gov:    Authorization: Bearer …, refresh-on-401 retry
+    """
+
+    def _stub_host(self, monkeypatch):
+        monkeypatch.setattr(app, "_ingress_host", lambda: "https://example.test")
+
+    def test_governance_call_sends_api_key_header(self, monkeypatch):
+        self._stub_host(monkeypatch)
+        monkeypatch.setattr(app, "_api_key", lambda: "the-api-key")
+        captured = {}
+
+        def fake_request(method, url, **kw):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = kw["headers"]
+            return type("R", (), {"status_code": 200})()
+        monkeypatch.setattr(app._session, "request", fake_request)
+
+        app._domino("GET", "api/governance/v1/bundles")
+        assert captured["url"] == "https://example.test/api/governance/v1/bundles"
+        assert captured["headers"]["X-Domino-Api-Key"] == "the-api-key"
+        assert "Authorization" not in captured["headers"]
+
+    def test_governance_does_not_mint_bearer(self, monkeypatch):
+        self._stub_host(monkeypatch)
+        monkeypatch.setattr(app, "_api_key", lambda: "k")
+
+        def boom(*args, **kw):
+            pytest.fail("_bearer should not be called for governance paths")
+        monkeypatch.setattr(app, "_bearer", boom)
+        monkeypatch.setattr(app._session, "request",
+                            lambda *a, **kw: type("R", (), {"status_code": 200})())
+
+        app._domino("GET", "api/governance/v1/policies/abc")
+
+    def test_governance_401_is_not_retried(self, monkeypatch):
+        self._stub_host(monkeypatch)
+        monkeypatch.setattr(app, "_api_key", lambda: "k")
+        call_count = {"n": 0}
+
+        def fake_request(*a, **kw):
+            call_count["n"] += 1
+            return type("R", (), {"status_code": 401})()
+        monkeypatch.setattr(app._session, "request", fake_request)
+
+        resp = app._domino("GET", "api/governance/v1/bundles")
+        assert resp.status_code == 401
+        assert call_count["n"] == 1, "governance 401s should not retry"
+
+    def test_non_governance_call_sends_bearer(self, monkeypatch):
+        self._stub_host(monkeypatch)
+        monkeypatch.setattr(app, "_bearer", lambda force=False: "the-bearer")
+        captured = {}
+
+        def fake_request(method, url, **kw):
+            captured["headers"] = kw["headers"]
+            return type("R", (), {"status_code": 200})()
+        monkeypatch.setattr(app._session, "request", fake_request)
+
+        app._domino("GET", "v4/projects")
+        assert captured["headers"]["Authorization"] == "Bearer the-bearer"
+        assert "X-Domino-Api-Key" not in captured["headers"]
+
+    def test_non_governance_401_force_refreshes_bearer(self, monkeypatch):
+        self._stub_host(monkeypatch)
+        bearer_calls = []
+        monkeypatch.setattr(app, "_bearer",
+                            lambda force=False: bearer_calls.append(force) or "tok")
+
+        responses = iter([
+            type("R", (), {"status_code": 401})(),
+            type("R", (), {"status_code": 200})(),
+        ])
+        monkeypatch.setattr(app._session, "request", lambda *a, **kw: next(responses))
+
+        resp = app._domino("GET", "v4/projects")
+        assert resp.status_code == 200
+        # First call without force, retry with force=True after the 401.
+        assert bearer_calls == [False, True]
+
+
 # ── _projects_from_bundles ────────────────────────────────────────────────────
 class TestProjectsFromBundles:
     def test_groups_bundles_by_project(self):
