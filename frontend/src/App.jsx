@@ -405,32 +405,67 @@ export default function App() {
   };
 
   // ── Load (progressive stream) ─────────────────────────────────────────────
+  // Transient retry status shown to the user during the load-retry loop.
+  // Format: { attempt, maxAttempts, delaySec, lastDetail }
+  const [loadRetry, setLoadRetry] = useState(null);
+
   useEffect(() => {
     let cancelled = false;
+    let attempt = 0;
+    const maxAttempts = 4;          // initial try + 3 retries
+    const backoffsMs = [2000, 4000, 8000]; // total worst-case wait ≈ 14s
+
     setLoadError(null);
+    setLoadRetry(null);
     setProjects([]);
     setBundles([]);
     setServerPolicies([]);
     setMetaReady(false);
     setPoliciesReady(false);
     evidenceCacheRef.current = new Map();
-    load({
-      onMeta: ({ projects, bundles }) => {
-        if (cancelled) return;
-        setProjects(projects || []);
-        setBundles(bundles || []);
-        setMetaReady(true);
-      },
-      onPolicies: ({ policies }) => {
-        if (cancelled) return;
-        setServerPolicies(policies || []);
-        setPoliciesReady(true);
-      },
-      onError: ({ stage, detail }) => {
-        if (cancelled) return;
-        setLoadError(`${stage || 'load'}: ${detail || 'unknown error'}`);
-      },
-    });
+
+    const tryLoad = () => {
+      attempt += 1;
+      let lastError = null;
+      load({
+        onMeta: ({ projects, bundles }) => {
+          if (cancelled) return;
+          setProjects(projects || []);
+          setBundles(bundles || []);
+          setMetaReady(true);
+          setLoadRetry(null);
+        },
+        onPolicies: ({ policies }) => {
+          if (cancelled) return;
+          setServerPolicies(policies || []);
+          setPoliciesReady(true);
+        },
+        onError: ({ stage, detail }) => {
+          if (cancelled) return;
+          lastError = `${stage || 'load'}: ${detail || 'unknown error'}`;
+          // Workspace public-API warmup can return transient 403s for ~30-60s
+          // after a fresh start. Retry with backoff before surfacing the
+          // error banner; user sees "retrying in Ns" in the loading area.
+          if (attempt < maxAttempts) {
+            const delayMs = backoffsMs[attempt - 1];
+            setLoadRetry({
+              attempt, maxAttempts,
+              delaySec: Math.round(delayMs / 1000),
+              lastDetail: detail || stage || '',
+            });
+            setTimeout(() => {
+              if (cancelled) return;
+              setLoadRetry((prev) => prev ? { ...prev, delaySec: 0 } : null);
+              tryLoad();
+            }, delayMs);
+          } else {
+            setLoadRetry(null);
+            setLoadError(lastError);
+          }
+        },
+      });
+    };
+    tryLoad();
     return () => { cancelled = true; };
   }, []);
 
@@ -966,12 +1001,16 @@ export default function App() {
           <div className="policy-empty loading">
             <span className="spin lg" />
             <div className="loading-text">
-              {metaReady
-                ? `Loading policies… (${fmtNumber(totalBundles)} bundles found)`
-                : 'Loading projects and bundles…'}
+              {loadRetry
+                ? `Workspace may still be warming up — retry ${loadRetry.attempt}/${loadRetry.maxAttempts}${loadRetry.delaySec > 0 ? ` in ${loadRetry.delaySec}s` : '…'}`
+                : metaReady
+                  ? `Loading policies… (${fmtNumber(totalBundles)} bundles found)`
+                  : 'Loading projects and bundles…'}
             </div>
             <div className="loading-sub muted">
-              {metaReady ? 'Fetching policy definitions in parallel.' : ''}
+              {loadRetry
+                ? `Last attempt: ${loadRetry.lastDetail || 'unknown error'}`
+                : metaReady ? 'Fetching policy definitions in parallel.' : ''}
             </div>
           </div>
         ) : policies.length === 0 ? (

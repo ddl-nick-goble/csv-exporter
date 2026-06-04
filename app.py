@@ -164,22 +164,31 @@ def _unwrap_list(data, keys):
     return []
 
 
-def _fetch_projects():
-    resp = _domino("GET", "v4/projects")
-    resp.raise_for_status()
-    out = []
-    for p in _unwrap_list(resp.json(), ["projects", "data", "items"]):
-        pid = p.get("id") or p.get("_id")
+def _projects_from_bundles(bundles):
+    """Derive the project list from the bundles response.
+
+    We used to hit /v4/projects on the public API for this, but that surface
+    has a 30-60s identity-propagation warmup after a workspace starts and
+    returns 403 during that window even though the governance API is happy.
+    The bundle list already carries projectId/projectName/projectOwner per
+    bundle — that's all the UI needs (the filter only shows projects with
+    at least one bundle anyway). One fewer call, zero warmup dependency.
+    """
+    by_id = {}
+    for b in bundles:
+        pid = b.get("projectId") or (b.get("project") or {}).get("id")
         if not pid:
             continue
-        owner = p.get("owner") or {}
-        out.append({
+        # First-seen wins on name/owner; bundles in the same project should
+        # report the same values, and any mismatch isn't worth a re-fetch.
+        if pid in by_id:
+            continue
+        by_id[pid] = {
             "id": pid,
-            "name": p.get("name") or "(unnamed)",
-            "owner_username": p.get("ownerUsername") or owner.get("userName") or "",
-            "owner_name": owner.get("fullName") or p.get("ownerUsername") or "",
-        })
-    return out
+            "name": b.get("projectName") or "(unnamed)",
+            "owner_username": b.get("projectOwner") or "",
+        }
+    return list(by_id.values())
 
 
 def _fetch_bundles():
@@ -328,15 +337,12 @@ def load():
     def gen():
         t0 = time.monotonic()
         try:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fut_projects = ex.submit(_fetch_projects)
-                fut_bundles = ex.submit(_fetch_bundles)
-                projects = fut_projects.result()
-                bundles = fut_bundles.result()
+            bundles = _fetch_bundles()
         except Exception as e:
-            log.exception("load: projects/bundles fetch failed")
+            log.exception("load: bundles fetch failed")
             yield line({"type": "error", "stage": "meta", "detail": str(e)})
             return
+        projects = _projects_from_bundles(bundles)
         yield line({"type": "meta", "projects": projects, "bundles": bundles})
 
         try:

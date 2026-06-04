@@ -124,6 +124,43 @@ class TestBundlePolicyRefs:
         assert app._bundle_policy_refs({}) == []
 
 
+# ── _projects_from_bundles ────────────────────────────────────────────────────
+class TestProjectsFromBundles:
+    def test_groups_bundles_by_project(self):
+        bundles = [
+            {"projectId": "p1", "projectName": "Alpha", "projectOwner": "nick"},
+            {"projectId": "p1", "projectName": "Alpha", "projectOwner": "nick"},
+            {"projectId": "p2", "projectName": "Beta",  "projectOwner": "jane"},
+        ]
+        out = sorted(app._projects_from_bundles(bundles), key=lambda p: p["id"])
+        assert out == [
+            {"id": "p1", "name": "Alpha", "owner_username": "nick"},
+            {"id": "p2", "name": "Beta",  "owner_username": "jane"},
+        ]
+
+    def test_skips_bundles_without_project_id(self):
+        bundles = [
+            {"projectName": "ghost"},                    # no id
+            {"projectId": "p1", "projectName": "real"},  # ok
+        ]
+        out = app._projects_from_bundles(bundles)
+        assert [p["id"] for p in out] == ["p1"]
+
+    def test_falls_back_to_unnamed(self):
+        bundles = [{"projectId": "p1"}]
+        out = app._projects_from_bundles(bundles)
+        assert out[0]["name"] == "(unnamed)"
+        assert out[0]["owner_username"] == ""
+
+    def test_picks_up_nested_project_id_shape(self):
+        bundles = [{"project": {"id": "p1"}, "projectName": "n"}]
+        out = app._projects_from_bundles(bundles)
+        assert [p["id"] for p in out] == ["p1"]
+
+    def test_empty_input(self):
+        assert app._projects_from_bundles([]) == []
+
+
 # ── _fetch_evidence_for_bundle ────────────────────────────────────────────────
 class TestFetchEvidenceForBundle:
     def test_no_policy_refs(self, monkeypatch):
