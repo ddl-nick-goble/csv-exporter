@@ -365,9 +365,9 @@ export default function App() {
 
   // ── Status filter ─────────────────────────────────────────────────────────
   // Empty set = show all. Non-empty = show only matching statuses.
-  const [statusFilter, setStatusFilter] = useState(() => new Set(['draft', 'published', 'archived']));
-  const [showUnused, setShowUnused] = useState(true);
-  const [showEmpty, setShowEmpty] = useState(true);
+  const [statusFilter, setStatusFilter] = useState(() => new Set(['published']));
+  const [showUnused, setShowUnused] = useState(false);
+  const [showEmpty, setShowEmpty] = useState(false);
   const toggleStatusFilter = useCallback((s) => setStatusFilter((prev) => {
     const next = new Set(prev);
     next.has(s) ? next.delete(s) : next.add(s);
@@ -542,21 +542,8 @@ export default function App() {
     return cols;
   }, [policies, numCols]);
 
-  // Combined visibility predicate for all filters. Cheap Set lookup used by
-  // both the masthead counter and the per-card visible prop.
-  const visiblePolicyIds = useMemo(() => {
-    const allStatuses = ['draft', 'published', 'archived'];
-    const allSelected = allStatuses.every((s) => statusFilter.has(s));
-    const ids = new Set();
-    for (const p of policies) {
-      if ((allSelected || statusFilter.has(p.status)) &&
-          (showUnused || p.bundleIds.size > 0) &&
-          (showEmpty || p.stages.length > 0)) {
-        ids.add(p.id);
-      }
-    }
-    return ids;
-  }, [policies, statusFilter, showUnused, showEmpty]);
+  // visiblePolicyIds is computed after projectMatchedBundles (below) so it
+  // can apply the project-scope gate. Placeholder keeps hook ordering stable.
 
   const unusedCount = useMemo(
     () => policies.filter((p) => p.bundleIds.size === 0).length,
@@ -705,6 +692,27 @@ export default function App() {
       return selectedProjectIds.has(pid);
     });
   }, [effectiveBundles, selectedProjectIds]);
+
+  // Combined visibility predicate for all filters. Cheap Set lookup used by
+  // both the masthead counter and the per-card visible prop. Lives here (after
+  // projectMatchedBundles) so it can gate on the project-scoped bundle set.
+  const visiblePolicyIds = useMemo(() => {
+    const allStatuses = ['draft', 'published', 'archived'];
+    const allSelected = allStatuses.every((s) => statusFilter.has(s));
+    const scopedIds = selectedProjectIds.size === 0
+      ? null
+      : new Set(projectMatchedBundles.map((b) => b.id || b._id).filter(Boolean));
+    const ids = new Set();
+    for (const p of policies) {
+      if (scopedIds !== null && ![...p.bundleIds].some((bid) => scopedIds.has(bid))) continue;
+      if ((allSelected || statusFilter.has(p.status)) &&
+          (showUnused || p.bundleIds.size > 0) &&
+          (showEmpty || p.stages.length > 0)) {
+        ids.add(p.id);
+      }
+    }
+    return ids;
+  }, [policies, statusFilter, showUnused, showEmpty, selectedProjectIds, projectMatchedBundles]);
 
   const bundlePolicyIds = useMemo(() => {
     // bundle.id -> Set<policyId> from the bundle's policies[] refs (or the
@@ -946,10 +954,26 @@ export default function App() {
           </div>
           <div className="masthead-right">
             <div className="masthead-stat">
-              <span className="stat-n">{showStats ? fmtNumber(projectsWithBundles) : '—'}</span>
+              {showStats && selectedProjectIds.size > 0 ? (
+                <>
+                  <span className="stat-n">{fmtNumber(selectedProjectIds.size)}</span>
+                  <span className="stat-l muted-2">/</span>
+                  <span className="stat-n">{fmtNumber(projectsWithBundles)}</span>
+                </>
+              ) : (
+                <span className="stat-n">{showStats ? fmtNumber(projectsWithBundles) : '—'}</span>
+              )}
               <span className="stat-l">projects</span>
               <span className="dot">·</span>
-              <span className="stat-n">{showStats ? fmtNumber(totalBundles) : '—'}</span>
+              {showStats && selectedProjectIds.size > 0 ? (
+                <>
+                  <span className="stat-n">{fmtNumber(projectMatchedBundles.length)}</span>
+                  <span className="stat-l muted-2">/</span>
+                  <span className="stat-n">{fmtNumber(totalBundles)}</span>
+                </>
+              ) : (
+                <span className="stat-n">{showStats ? fmtNumber(totalBundles) : '—'}</span>
+              )}
               <span className="stat-l">bundles</span>
               <span className="dot">·</span>
               {policiesReady && visiblePolicyIds.size !== policies.length ? (
@@ -1103,7 +1127,7 @@ export default function App() {
               </button>
             ))}
           </div>
-          <span className="filter-item-desc">Filter by lifecycle status</span>
+          <span className="filter-item-desc">Filter policy by status</span>
         </div>
 
         <div className="filter-item">
@@ -1127,25 +1151,25 @@ export default function App() {
               {policiesReady && <span className="status-filter-count">{fmtNumber(emptyCount)}</span>}
             </button>
           </div>
-          <span className="filter-item-desc">Show or hide by content</span>
+          <span className="filter-item-desc">Exclude hanging policies</span>
         </div>
 
         <div className="filter-gap" />
 
-        <div className="filter-item">
+        <div className="filter-item filter-item-right">
           <span className="filter-actions">
             <button className="ghost" onClick={() => setAllQuestions('all')} disabled={selectedCount === totalQuestions}>Select all</button>
             <button className="ghost" onClick={() => setAllQuestions('none')} disabled={selectedCount === 0}>Clear</button>
           </span>
-          <span className="filter-item-desc">Questions</span>
+          <span className="filter-item-desc">Policy evidence</span>
         </div>
 
-        <div className="filter-item">
+        <div className="filter-item filter-item-right">
           <span className="filter-actions">
-            <button className="ghost" onClick={expandAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size === 0}>Expand all</button>
-            <button className="ghost" onClick={collapseAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size >= policies.length}>Collapse all</button>
+            <button className="ghost" onClick={expandAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size === 0}>Expand</button>
+            <button className="ghost" onClick={collapseAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size >= policies.length}>Collapse</button>
           </span>
-          <span className="filter-item-desc">Cards</span>
+          <span className="filter-item-desc">Policy cards</span>
         </div>
       </div>
 

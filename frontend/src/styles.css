@@ -180,6 +180,21 @@ button { font-family: inherit; cursor: pointer; }
   display: flex; flex-direction: column; justify-content: space-between; gap: 4px;
 }
 .filter-item-desc { font-size: 10.5px; color: var(--muted-2); padding-left: 1px; white-space: nowrap; }
+.filter-item-right { align-items: flex-end; }
+.filter-item-right .filter-actions {
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--panel);
+}
+.filter-item-right .filter-actions .ghost {
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+.filter-item-right .filter-actions .ghost:first-child { border-left: none; }
 .filter-gap { flex: 1; min-width: 8px; }
 
 .proj-filter { position: relative; }
