@@ -1,0 +1,22 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pragmatic default ruleset: pyflakes (F), pycodestyle errors (E), unused
+# imports (I), bug-bears (B), and a few obvious comprehension/anti-pattern
+# checks. Nothing opinionated about formatting.
+select = ["F", "E", "W", "I", "B", "C4", "UP"]
+ignore = [
+  # Long lines are fine in this codebase; tabular comments and SQL-ish
+  # literals would get harder to read with hard wrapping.
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]  # Tests use patterns ruff would otherwise flag.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
