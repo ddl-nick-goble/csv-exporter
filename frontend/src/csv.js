@@ -324,7 +324,10 @@ export class CsvBuilder {
     this.metaCols = metaCols;
     this.questionCols = questionCols;
   }
-  build(bundleRows) {
+  // Returns the array of string parts (BOM + header row + data rows). Used
+  // by build() and exposed separately so tests can assert against text
+  // without needing a working Blob.text()/arrayBuffer() in their runtime.
+  buildParts(bundleRows) {
     const headers = [...this.metaCols, ...this.questionCols.map((q) => q.header || q.label)];
     const parts = ['﻿', row(headers)];
     for (const b of bundleRows) {
@@ -333,6 +336,12 @@ export class CsvBuilder {
         ...this.questionCols.map((q) => b.answers[q.id] ?? ''),
       ]));
     }
-    return new Blob(parts, { type: 'text/csv;charset=utf-8' });
+    return parts;
+  }
+  buildText(bundleRows) {
+    return this.buildParts(bundleRows).join('');
+  }
+  build(bundleRows) {
+    return new Blob(this.buildParts(bundleRows), { type: 'text/csv;charset=utf-8' });
   }
 }
