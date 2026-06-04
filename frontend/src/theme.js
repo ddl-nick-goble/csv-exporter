@@ -1,42 +1,31 @@
-// Light/dark theme state. Persisted to localStorage; defaults to the OS
-// preference via `prefers-color-scheme`.
+// Light/dark theme state. Persisted to a cookie so it survives across
+// Domino app restarts and different browser sessions, matching the
+// durability of server-side user storage.
 //
-// Compatibility contract (same posture as presets.js):
-//   - Stored value is either the string "light" or "dark". Anything else is
-//     ignored, and the effective theme falls back to system preference.
-//   - Reading never throws (private-mode storage, quota errors, etc).
+// Cookie: governance-exporter:theme  value: "light" | "dark"
+// Expiry: 1 year rolling; SameSite=Lax; path=/
 
-const STORAGE_KEY = 'governance-exporter:theme';
+const COOKIE_KEY = 'governance-exporter:theme';
 
-const safeStorage = () => {
+function readCookie() {
   try {
-    if (typeof window === 'undefined') return null;
-    return window.localStorage;
+    const match = document.cookie.split('; ').find((r) => r.startsWith(COOKIE_KEY + '='));
+    if (!match) return null;
+    const v = match.split('=')[1];
+    return v === 'light' || v === 'dark' ? v : null;
   } catch { return null; }
-};
-
-export function readStored() {
-  const s = safeStorage();
-  if (!s) return null;
-  let v;
-  try { v = s.getItem(STORAGE_KEY); } catch { return null; }
-  return v === 'light' || v === 'dark' ? v : null;
 }
 
-function writeStored(theme) {
-  const s = safeStorage();
-  if (!s) return;
-  try { s.setItem(STORAGE_KEY, theme); } catch {}
+function writeCookie(theme) {
+  try {
+    const age = 365 * 24 * 60 * 60;
+    document.cookie = `${COOKIE_KEY}=${theme}; max-age=${age}; path=/; SameSite=Lax`;
+  } catch {}
 }
 
-function systemPref() {
-  if (typeof window === 'undefined' || !window.matchMedia) return 'light';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
-
-// Effective theme: stored choice (if any) > system preference.
+// Effective theme: cookie choice (if any) > light default.
 export function effective() {
-  return readStored() || systemPref();
+  return readCookie() || 'light';
 }
 
 // Apply theme to <html>. Called by the inline boot script in index.html
@@ -48,7 +37,7 @@ export function apply(theme) {
 
 export function setTheme(theme) {
   const t = theme === 'dark' ? 'dark' : 'light';
-  writeStored(t);
+  writeCookie(t);
   apply(t);
   return t;
 }

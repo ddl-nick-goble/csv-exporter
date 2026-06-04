@@ -5,21 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Governance Evidence Exporter</title>
   <script>
-    // Apply theme before paint to avoid a light-flash on dark-mode loads.
-    // Mirrors the logic in src/theme.js — kept inline so it runs synchronously
-    // before the React bundle parses.
+    // Apply theme before paint to avoid a flash. Mirrors src/theme.js.
     (function () {
       try {
         var stored = null;
-        try { stored = localStorage.getItem('governance-exporter:theme'); } catch (e) {}
-        var theme = (stored === 'light' || stored === 'dark')
-          ? stored
-          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-        document.documentElement.setAttribute('data-theme', theme);
+        try {
+          var m = document.cookie.split('; ').find(function(r) { return r.indexOf('governance-exporter:theme=') === 0; });
+          if (m) stored = m.split('=')[1];
+        } catch (e) {}
+        document.documentElement.setAttribute('data-theme', stored === 'dark' ? 'dark' : 'light');
       } catch (e) {}
     })();
   </script>
-  <script type="module" crossorigin src="./assets/index-B_mgKTtw.js"></script>
+  <script type="module" crossorigin src="./assets/index-C8ICSOSO.js"></script>
   <link rel="stylesheet" crossorigin href="./assets/index-D6tGvw_K.css">
 </head>
 <body>
