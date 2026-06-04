@@ -318,6 +318,72 @@ def _fetch_policies_for_bundles(bundles):
     return out
 
 
+def _fetch_policy_overviews():
+    """Page through api/governance/v1/policy-overviews to get every policy
+    summary (id + status) visible to this user, including drafts with no bundles."""
+    out = []
+    limit = 200
+    offset = 0
+    while True:
+        resp = _domino("GET", "api/governance/v1/policy-overviews",
+                       params={"limit": limit, "offset": offset})
+        if not resp.ok:
+            if 400 <= resp.status_code < 500 and offset == 0:
+                log.warning("policy-overviews returned %s; falling back to bundle-derived set",
+                            resp.status_code)
+                return []
+            resp.raise_for_status()
+        items = _unwrap_list(resp.json(), ["policies", "data", "items"])
+        if not items:
+            break
+        out.extend(items)
+        if len(items) < limit:
+            break
+        offset += limit
+    return out
+
+
+def _fetch_all_policies(bundles):
+    """Union of bundle-referenced policies and the full policy-overviews list.
+    Draft policies with no bundles only appear via policy-overviews.
+    Status from the overview is injected into the full policy definition."""
+    # Collect IDs from bundles.
+    bundle_pids = set()
+    for b in bundles:
+        for ref in _bundle_policy_refs(b):
+            bundle_pids.add(ref["policyId"])
+
+    # Fetch overviews; build id→status map and union of IDs.
+    try:
+        overviews = _fetch_policy_overviews()
+    except Exception as e:
+        log.warning("fetch_policy_overviews failed: %s — using bundle-derived set", e)
+        overviews = []
+    status_by_id = {o["id"]: o.get("status", "") for o in overviews if o.get("id")}
+    all_pids = bundle_pids | set(status_by_id.keys())
+
+    if not all_pids:
+        return []
+
+    out = []
+    with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+        futures = {ex.submit(_fetch_policy, pid): pid for pid in all_pids}
+        for f in as_completed(futures):
+            pid = futures[f]
+            try:
+                pol = f.result()
+            except Exception as e:
+                log.warning("policy fetch failed for %s: %s", pid, e)
+                continue
+            if pol:
+                # Inject status from the overview if the full definition
+                # doesn't already carry it.
+                if not pol.get("status") and pid in status_by_id:
+                    pol["status"] = status_by_id[pid]
+                out.append(pol)
+    return out
+
+
 def _compute_policy(bundle_id, policy_id, policy_version_id=None):
     """One compute-policy call for a (bundle, policy) pair. Returns the
     computed payload or None if the user can't compute it (403/404)."""
@@ -388,7 +454,7 @@ def load():
         yield line({"type": "meta", "projects": projects, "bundles": bundles})
 
         try:
-            policies = _fetch_policies_for_bundles(bundles)
+            policies = _fetch_all_policies(bundles)
         except Exception as e:
             log.exception("load: policies fetch failed")
             yield line({"type": "error", "stage": "policies", "detail": str(e)})

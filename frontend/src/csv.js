@@ -228,6 +228,7 @@ function policyOutline(policy) {
   return {
     id: policy.id,
     name: policy.name || '(unnamed policy)',
+    status: (policy.status || policy.lifecycleStatus || '').toLowerCase(),
     version: '',
     bundleIds: new Set(),
     stages,
@@ -263,12 +264,12 @@ export function buildPolicyOutlines(policies, bundles) {
       if (!outline.version && r.policyVersion) outline.version = r.policyVersion;
     }
   }
-  // Drop outlines with no questions (defensive — happens if a policy has only
-  // empty stages, which would render as an empty card in the picker).
-  const out = [...byId.values()].filter((o) =>
-    o.stages.some((s) => s.sections.some((sec) => sec.questions.length))
-  );
-  return out.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const statusRank = { draft: 0, published: 1, archived: 2 };
+  return [...byId.values()].sort((a, b) => {
+    const sr = (statusRank[a.status] ?? 99) - (statusRank[b.status] ?? 99);
+    if (sr !== 0) return sr;
+    return (a.name || '').localeCompare(b.name || '');
+  });
 }
 
 // Collect { artifactId -> latestAnswerString } for the artifacts that pass

@@ -48,7 +48,7 @@ const isoStamp = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const fileStamp = () => new Date().toISOString().replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
 // Tri-state checkbox: 'all' (checked) | 'some' (indeterminate) | 'none' (unchecked).
-function Tristate({ state, onChange, ariaLabel, className }) {
+function Tristate({ state, onChange, ariaLabel, className, disabled }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) ref.current.indeterminate = state === 'some';
@@ -61,6 +61,7 @@ function Tristate({ state, onChange, ariaLabel, className }) {
       checked={state === 'all'}
       onChange={() => onChange(state === 'all' ? 'none' : 'all')}
       aria-label={ariaLabel}
+      disabled={disabled}
     />
   );
 }
@@ -208,6 +209,7 @@ const PolicyCard = React.memo(function PolicyCard({
   selectedArtifactIds,
 }) {
   const totalQ = artifactIdsForPolicy(policy).length;
+  const isEmpty = totalQ === 0;
   const isSelected = (id) => selectedArtifactIds === null ? true : selectedArtifactIds.has(id);
   const sectionState = (sec) => {
     if (selectedArtifactIds === null) return 'all';
@@ -218,17 +220,19 @@ const PolicyCard = React.memo(function PolicyCard({
     return 'some';
   };
   return (
-    <section className={`policy-card${pState === 'none' ? ' off' : ''}${collapsed ? ' collapsed' : ''}`}>
+    <section className={`policy-card${pState === 'none' ? ' off' : ''}${isEmpty ? ' empty' : ''}${collapsed ? ' collapsed' : ''}`}>
       <header className="policy-card-head">
         <Tristate
           state={pState}
           onChange={(target) => onSetPolicySelection(policy, target)}
           ariaLabel={`Include policy ${policy.name}`}
           className="policy-master"
+          disabled={isEmpty}
         />
         <div className="policy-name" title={policy.name}>
           {policy.name}
           {policy.version && <span className="policy-version">v{policy.version}</span>}
+          {policy.status && <span className={`policy-status-badge status-${policy.status}`}>{policy.status}</span>}
         </div>
         <div className="policy-count">
           <span className={pState === 'some' ? 'emph' : ''}>{onCount}</span>
@@ -246,7 +250,9 @@ const PolicyCard = React.memo(function PolicyCard({
       </header>
       {!collapsed && (
         <div className="policy-card-body">
-          {policy.stages.map((stage, stageIdx) => (
+          {isEmpty ? (
+            <div className="policy-empty-note">No questions configured</div>
+          ) : policy.stages.map((stage, stageIdx) => (
             <div className="stage-card" key={stage.id || stageIdx}>
               <div className="stage-head">
                 <span className="stage-label">STAGE {stageIdx + 1}</span>
@@ -339,6 +345,17 @@ export default function App() {
   }), []);
   const collapseAllPolicies = () => setCollapsedPolicies(new Set(policies.map((p) => p.id)));
   const expandAllPolicies = () => setCollapsedPolicies(new Set());
+
+  // ── Status filter ─────────────────────────────────────────────────────────
+  // Empty set = show all. Non-empty = show only matching statuses.
+  const [statusFilter, setStatusFilter] = useState(() => new Set(['draft', 'published', 'archived']));
+  const [showUnused, setShowUnused] = useState(true);
+  const [showEmpty, setShowEmpty] = useState(true);
+  const toggleStatusFilter = useCallback((s) => setStatusFilter((prev) => {
+    const next = new Set(prev);
+    next.has(s) ? next.delete(s) : next.add(s);
+    return next;
+  }), []);
 
   // ── Export state ───────────────────────────────────────────────────────────
   const [exporting, setExporting] = useState(false);
@@ -483,11 +500,57 @@ export default function App() {
 
   // Distribute policies into columns round-robin so cards never reorder when
   // a card is expanded — each card stays in its assigned column forever.
+  // Column assignment uses the policy's position in the FULL policies array so
+  // toggling the status filter never moves a card to a different column (which
+  // would unmount/remount it and all its children).
+  // statusFilter is a display-only filter; selection/export counts ignore it.
   const policyColumns = useMemo(() => {
+    const allStatuses = ['draft', 'published', 'archived'];
+    const allSelected = allStatuses.every((s) => statusFilter.has(s));
     const cols = Array.from({ length: numCols }, () => []);
-    policies.forEach((p, i) => cols[i % numCols].push(p));
+    policies.forEach((p, i) => {
+      if (allSelected || statusFilter.has(p.status)) {
+        if ((showUnused || p.bundleIds.size > 0) && (showEmpty || p.stages.length > 0)) {
+          cols[i % numCols].push(p);
+        }
+      }
+    });
     return cols;
-  }, [policies, numCols]);
+  }, [policies, numCols, statusFilter, showUnused, showEmpty]);
+
+  const unusedCount = useMemo(
+    () => policies.filter((p) => p.bundleIds.size === 0).length,
+    [policies],
+  );
+  const emptyCount = useMemo(
+    () => policies.filter((p) => p.stages.length === 0).length,
+    [policies],
+  );
+
+  const policyCounts = useMemo(() => {
+    const counts = { draft: 0, published: 0, archived: 0 };
+    for (const p of policies) {
+      const s = p.status;
+      if (s in counts) counts[s]++;
+    }
+    return counts;
+  }, [policies]);
+
+  // Per-policy selection stats — keyed on policies+selectedArtifactIds so they
+  // don't recompute on a statusFilter toggle (selection didn't change).
+  const policyStats = useMemo(() => {
+    const m = new Map();
+    for (const p of policies) {
+      const ids = artifactIdsForPolicy(p);
+      const totalQ = ids.length;
+      const onCount = selectedArtifactIds === null
+        ? totalQ
+        : ids.reduce((n, id) => n + (selectedArtifactIds.has(id) ? 1 : 0), 0);
+      const pState = totalQ === 0 || onCount === 0 ? 'none' : onCount === totalQ ? 'all' : 'some';
+      m.set(p.id, { pState, onCount });
+    }
+    return m;
+  }, [policies, selectedArtifactIds]);
 
   // policyArtifactIds and effectiveBundles must be available to every other
   // bundle-derived memo below. Defined here so the bundle counts in the
@@ -555,18 +618,6 @@ export default function App() {
   }, [policies, selectedArtifactIds, selectedCount]);
   const isQuestionSelected = (id) =>
     selectedArtifactIds === null ? true : selectedArtifactIds.has(id);
-
-  const setStateFromIds = (ids) => {
-    if (ids.length === 0) return 'none';
-    if (selectedArtifactIds === null) return 'all';
-    let on = 0;
-    for (const id of ids) if (selectedArtifactIds.has(id)) on++;
-    if (on === 0) return 'none';
-    if (on === ids.length) return 'all';
-    return 'some';
-  };
-  const policyState = (policy) => setStateFromIds(artifactIdsForPolicy(policy));
-  const sectionStateOf = (section) => setStateFromIds(artifactIdsForSection(section));
 
   const toggleQuestion = useCallback((id) => {
     setSelectedArtifactIds((prev) => {
@@ -861,7 +912,15 @@ export default function App() {
               <span className="stat-n">{showStats ? fmtNumber(totalBundles) : '—'}</span>
               <span className="stat-l">bundles</span>
               <span className="dot">·</span>
-              <span className="stat-n">{policiesReady ? fmtNumber(policies.length) : '—'}</span>
+              {policiesReady && (!['draft','published','archived'].every(s => statusFilter.has(s)) || !showUnused || !showEmpty) ? (
+                <>
+                  <span className="stat-n">{fmtNumber(policyColumns.reduce((s, c) => s + c.length, 0))}</span>
+                  <span className="stat-l muted-2">/</span>
+                  <span className="stat-n">{fmtNumber(policies.length)}</span>
+                </>
+              ) : (
+                <span className="stat-n">{policiesReady ? fmtNumber(policies.length) : '—'}</span>
+              )}
               <span className="stat-l">policies</span>
             </div>
             <button
@@ -888,111 +947,165 @@ export default function App() {
       )}
 
       <div className="filter-row">
-        <div className="filter-dropdowns">
-        <details className="proj-filter preset-menu">
-          <summary>
-            <span className="muted">Presets:</span>
-            <span className="filter-value">
-              {presets.length === 0 ? 'None saved' : `${fmtNumber(presets.length)} saved`}
-            </span>
-            <span className="caret">▾</span>
-          </summary>
-          <div className="proj-filter-body preset-body">
-            <div className="preset-save-row">
-              <input
-                className="search"
-                placeholder="Name this preset…"
-                value={presetName}
-                onChange={(e) => setPresetName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') saveCurrentPreset(); }}
-              />
-              <button className="ghost" onClick={saveCurrentPreset} disabled={!presetName.trim()}>
-                Save current
-              </button>
+        <div className="filter-item">
+          <details className="proj-filter preset-menu">
+            <summary>
+              <span className="muted">Presets:</span>
+              <span className="filter-value">
+                {presets.length === 0 ? 'None saved' : `${fmtNumber(presets.length)} saved`}
+              </span>
+              <span className="caret">▾</span>
+            </summary>
+            <div className="proj-filter-body preset-body">
+              <div className="preset-save-row">
+                <input
+                  className="search"
+                  placeholder="Name this preset…"
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') saveCurrentPreset(); }}
+                />
+                <button className="ghost" onClick={saveCurrentPreset} disabled={!presetName.trim()}>
+                  Save current
+                </button>
+              </div>
+              <div className="proj-filter-list">
+                {presets.length === 0 ? (
+                  <div className="muted center small">No saved presets yet.</div>
+                ) : presets.map((p) => (
+                  <div className="preset-line" key={p.name}>
+                    <button
+                      className="preset-apply"
+                      onClick={() => applyPreset(p)}
+                      title={`Apply preset — ${p.projectIds.length} project${p.projectIds.length === 1 ? '' : 's'}, ${p.artifactIds === null ? 'all' : p.artifactIds.length} question${p.artifactIds && p.artifactIds.length === 1 ? '' : 's'}`}
+                    >
+                      {p.name}
+                    </button>
+                    <span className="muted small">
+                      {p.projectIds.length || 'all'} proj · {p.artifactIds === null ? 'all' : p.artifactIds.length} q
+                    </span>
+                    <button
+                      className="ghost preset-delete"
+                      onClick={() => deletePreset(p.name)}
+                      title="Delete preset"
+                      aria-label={`Delete preset ${p.name}`}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="preset-foot">
+                {presetMsg && <span className="preset-msg muted small">{presetMsg}</span>}
+                <button
+                  className="ghost"
+                  onClick={clearAllPresets}
+                  disabled={presets.length === 0}
+                >
+                  Clear all
+                </button>
+              </div>
             </div>
-            <div className="proj-filter-list">
-              {presets.length === 0 ? (
-                <div className="muted center small">No saved presets yet.</div>
-              ) : presets.map((p) => (
-                <div className="preset-line" key={p.name}>
-                  <button
-                    className="preset-apply"
-                    onClick={() => applyPreset(p)}
-                    title={`Apply preset — ${p.projectIds.length} project${p.projectIds.length === 1 ? '' : 's'}, ${p.artifactIds === null ? 'all' : p.artifactIds.length} question${p.artifactIds && p.artifactIds.length === 1 ? '' : 's'}`}
-                  >
-                    {p.name}
-                  </button>
-                  <span className="muted small">
-                    {p.projectIds.length || 'all'} proj · {p.artifactIds === null ? 'all' : p.artifactIds.length} q
-                  </span>
-                  <button
-                    className="ghost preset-delete"
-                    onClick={() => deletePreset(p.name)}
-                    title="Delete preset"
-                    aria-label={`Delete preset ${p.name}`}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-            <div className="preset-foot">
-              {presetMsg && <span className="preset-msg muted small">{presetMsg}</span>}
-              <button
-                className="ghost"
-                onClick={clearAllPresets}
-                disabled={presets.length === 0}
-              >
-                Clear all
-              </button>
-            </div>
-          </div>
-        </details>
-
-        <details className="proj-filter">
-          <summary>
-            <span className="muted">Projects:</span>
-            <span className="filter-value">{projectFilterLabel}</span>
-            <span className="caret">▾</span>
-          </summary>
-          <div className="proj-filter-body">
-            <div className="proj-filter-tools">
-              <input
-                className="search"
-                placeholder="Filter…"
-                value={projectSearch}
-                onChange={(e) => setProjectSearch(e.target.value)}
-              />
-              <button className="ghost" onClick={setAllProjects} title="Include every project">All</button>
-              <button className="ghost" onClick={selectVisibleProjects} title="Select all visible">Visible</button>
-            </div>
-            <div className="proj-filter-list">
-              {filteredFilterProjects.length === 0 ? (
-                <div className="muted center small">No matching projects.</div>
-              ) : filteredFilterProjects.map((p) => (
-                <label className="proj-filter-line" key={p.id}>
-                  <input
-                    type="checkbox"
-                    checked={selectedProjectIds.has(p.id)}
-                    onChange={() => toggleProject(p.id)}
-                  />
-                  <span className="proj-filter-name" title={p.name}>{p.name}</span>
-                  <span className="proj-filter-count">{p.bundle_count}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        </details>
+          </details>
+          <span className="filter-item-desc">Save &amp; load question presets</span>
         </div>
 
-        <div className="filter-summary">
+        <div className="filter-item">
+          <details className="proj-filter">
+            <summary>
+              <span className="muted">Projects:</span>
+              <span className="filter-value">{projectFilterLabel}</span>
+              <span className="caret">▾</span>
+            </summary>
+            <div className="proj-filter-body">
+              <div className="proj-filter-tools">
+                <input
+                  className="search"
+                  placeholder="Filter…"
+                  value={projectSearch}
+                  onChange={(e) => setProjectSearch(e.target.value)}
+                />
+                <button className="ghost" onClick={setAllProjects} title="Include every project">All</button>
+                <button className="ghost" onClick={selectVisibleProjects} title="Select all visible">Visible</button>
+              </div>
+              <div className="proj-filter-list">
+                {filteredFilterProjects.length === 0 ? (
+                  <div className="muted center small">No matching projects.</div>
+                ) : filteredFilterProjects.map((p) => (
+                  <label className="proj-filter-line" key={p.id}>
+                    <input
+                      type="checkbox"
+                      checked={selectedProjectIds.has(p.id)}
+                      onChange={() => toggleProject(p.id)}
+                    />
+                    <span className="proj-filter-name" title={p.name}>{p.name}</span>
+                    <span className="proj-filter-count">{p.bundle_count}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </details>
+          <span className="filter-item-desc">Select projects in scope</span>
+        </div>
+
+        <div className="filter-item">
+          <div className="status-filter" role="group" aria-label="Filter by policy status">
+            {['draft', 'published', 'archived'].map((s) => (
+              <button
+                key={s}
+                type="button"
+                className={`status-filter-btn${statusFilter.has(s) ? ' on' : ''} status-filter-${s}`}
+                onClick={() => toggleStatusFilter(s)}
+                aria-pressed={statusFilter.has(s)}
+              >
+                {s}
+                {policiesReady && <span className="status-filter-count">{fmtNumber(policyCounts[s] ?? 0)}</span>}
+              </button>
+            ))}
+          </div>
+          <span className="filter-item-desc">Filter by lifecycle status</span>
+        </div>
+
+        <div className="filter-item">
+          <div className="status-filter" role="group" aria-label="Show or hide policies">
+            <button
+              type="button"
+              className={`status-filter-btn status-filter-unused${showUnused ? ' on' : ''}`}
+              onClick={() => setShowUnused((v) => !v)}
+              aria-pressed={showUnused}
+            >
+              unused
+              {policiesReady && <span className="status-filter-count">{fmtNumber(unusedCount)}</span>}
+            </button>
+            <button
+              type="button"
+              className={`status-filter-btn status-filter-empty${showEmpty ? ' on' : ''}`}
+              onClick={() => setShowEmpty((v) => !v)}
+              aria-pressed={showEmpty}
+            >
+              empty
+              {policiesReady && <span className="status-filter-count">{fmtNumber(emptyCount)}</span>}
+            </button>
+          </div>
+          <span className="filter-item-desc">Show or hide by content</span>
+        </div>
+
+        <div className="filter-gap" />
+
+        <div className="filter-item">
           <span className="filter-actions">
             <button className="ghost" onClick={() => setAllQuestions('all')} disabled={selectedCount === totalQuestions}>Select all</button>
             <button className="ghost" onClick={() => setAllQuestions('none')} disabled={selectedCount === 0}>Clear</button>
-            <span className="filter-actions-sep" aria-hidden="true" />
+          </span>
+          <span className="filter-item-desc">Questions</span>
+        </div>
+
+        <div className="filter-item">
+          <span className="filter-actions">
             <button className="ghost" onClick={expandAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size === 0}>Expand all</button>
             <button className="ghost" onClick={collapseAllPolicies} disabled={policies.length === 0 || collapsedPolicies.size >= policies.length}>Collapse all</button>
           </span>
+          <span className="filter-item-desc">Cards</span>
         </div>
       </div>
 
@@ -1019,11 +1132,7 @@ export default function App() {
           policyColumns.map((col, colIdx) => (
             <div key={colIdx} className="policy-col">
               {col.map((policy) => {
-                const pState = policyState(policy);
-                const totalQ = artifactIdsForPolicy(policy).length;
-                const onCount = selectedArtifactIds === null
-                  ? totalQ
-                  : artifactIdsForPolicy(policy).filter((id) => selectedArtifactIds.has(id)).length;
+                const { pState, onCount } = policyStats.get(policy.id) || { pState: 'none', onCount: 0 };
                 const collapsed = collapsedPolicies.has(policy.id);
                 return (
                   <PolicyCard

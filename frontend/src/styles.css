@@ -173,13 +173,14 @@ button { font-family: inherit; cursor: pointer; }
 
 /* ── Filter row (compact project picker + selection summary) ─────────────── */
 .filter-row {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; flex-wrap: wrap;
+  display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap;
   padding: 0;
 }
-/* Cluster the dropdowns on the left with a tight gap; .filter-summary
- * naturally takes the right side via the parent's space-between. */
-.filter-dropdowns { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.filter-item {
+  display: flex; flex-direction: column; justify-content: space-between; gap: 4px;
+}
+.filter-item-desc { font-size: 10.5px; color: var(--muted-2); padding-left: 1px; white-space: nowrap; }
+.filter-gap { flex: 1; min-width: 8px; }
 
 .proj-filter { position: relative; }
 .proj-filter summary {
@@ -240,7 +241,7 @@ button { font-family: inherit; cursor: pointer; }
   font-variant-numeric: tabular-nums;
 }
 .filter-summary .dot { color: var(--border-2); }
-.filter-actions { display: inline-flex; align-items: center; gap: 8px; margin-left: 8px; }
+.filter-actions { display: inline-flex; align-items: center; gap: 8px; }
 .filter-actions-sep {
   width: 1px; height: 16px;
   background: var(--border);
@@ -269,6 +270,77 @@ button { font-family: inherit; cursor: pointer; }
   background: var(--panel);
 }
 
+/* ── Status filter toggle ─────────────────────────────────────────────────── */
+.status-filter-wrap {
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.status-filter-label { font-size: 12.5px; white-space: nowrap; }
+.status-filter {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--panel);
+}
+.status-filter-btn {
+  border: none;
+  border-left: 1px solid var(--border);
+  padding: 5px 11px;
+  font-size: 12px; font-family: inherit;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  text-transform: capitalize;
+  transition: background 0.1s, color 0.1s, box-shadow 0.1s;
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.status-filter-btn:first-child { border-left: none; }
+.status-filter-btn:hover { background: var(--bg-2); color: var(--text); }
+
+/* × when off, colored dot when on */
+.status-filter-btn::before {
+  content: '×';
+  font-size: 11px;
+  color: var(--muted-2);
+  flex-shrink: 0;
+  line-height: 1;
+}
+.status-filter-btn.on::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+}
+.status-filter-btn.on { font-weight: 600; }
+.status-filter-count {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+  font-weight: 500;
+}
+.status-filter-btn.on.status-filter-draft {
+  color: var(--warn);
+  background: rgba(154, 103, 0, 0.10);
+  box-shadow: inset 0 -2px 0 var(--warn);
+}
+.status-filter-btn.on.status-filter-published {
+  color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.status-filter-btn.on.status-filter-archived {
+  color: var(--text-strong);
+  background: var(--bg-2);
+  box-shadow: inset 0 -2px 0 var(--text-strong);
+}
+.status-filter-btn.on.status-filter-unused,
+.status-filter-btn.on.status-filter-empty {
+  color: var(--text);
+  background: var(--bg-2);
+  box-shadow: inset 0 -2px 0 var(--muted-2);
+}
+
 .policy-card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -277,6 +349,28 @@ button { font-family: inherit; cursor: pointer; }
 }
 .policy-card.off { opacity: 0.55; }
 .policy-card.off:hover { opacity: 0.85; }
+.policy-card.off.empty:hover { opacity: 0.55; }
+.policy-card.empty .policy-master { cursor: not-allowed; }
+.policy-empty-note {
+  padding: 16px;
+  text-align: center;
+  color: var(--muted-2);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* ── Policy status badge ──────────────────────────────────────────────────── */
+.policy-status-badge {
+  font-size: 10px; font-weight: 500;
+  padding: 1px 5px;
+  border-radius: var(--radius);
+  text-transform: capitalize;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+.status-draft     { background: rgba(154, 103, 0, 0.10); color: var(--warn); }
+.status-published { background: var(--accent-soft); color: var(--accent); }
+.status-archived  { background: var(--muted); color: var(--bg); }
 
 /* Column-title bar — light grey shading sets it apart as the card's
  * header without resorting to a saturated fill. The title earns its
