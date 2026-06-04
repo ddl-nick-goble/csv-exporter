@@ -14,3 +14,6 @@ __pycache__/
 
 # Swagger spec (not source-of-truth)
 swagger_0.json
+
+# Node modules — installed by 'npm ci', not tracked
+node_modules/
