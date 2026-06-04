@@ -71,6 +71,13 @@
 
 html, body { background: var(--bg); color: var(--text); }
 
+/* Scrollbars — themed via CSS variables so dark mode works automatically. */
+* { scrollbar-width: thin; scrollbar-color: var(--border-2) var(--bg-2); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-2); }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted-2); }
+
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
 body {
