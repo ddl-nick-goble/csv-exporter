@@ -331,6 +331,22 @@ export default function App() {
   // Evidence is fetched at export time only — see handleExport.
   const evidenceCacheRef = useRef(new Map());
 
+  // ── Extension project context (Domino deep-link query params) ─────────────
+  // When loaded as a Domino extension from a project's sidebar, Domino appends
+  // query params so the tool can scope itself to that project. Supported:
+  //   ?projectId=<id>  (preferred)
+  //   ?projectOwner=<owner>&projectName=<name>  (fallback)
+  // If no params are present we show everything (standalone / admin use).
+  const urlProjectContext = useMemo(() => {
+    const p = new URLSearchParams(window.location.search);
+    return {
+      projectId: p.get('projectId') || null,
+      projectOwner: p.get('projectOwner') || p.get('ownerUsername') || null,
+      projectName: p.get('projectName') || null,
+    };
+  }, []);
+  const autoSelectAppliedRef = useRef(false);
+
   // ── User selections ────────────────────────────────────────────────────────
   const [selectedProjectIds, setSelectedProjectIds] = useState(() => new Set());
   // null = "every question selected" sentinel; first interaction materializes
@@ -486,6 +502,23 @@ export default function App() {
     tryLoad();
     return () => { cancelled = true; };
   }, []);
+
+  // Auto-select the project from URL context once data arrives.
+  useEffect(() => {
+    if (!metaReady || autoSelectAppliedRef.current) return;
+    const { projectId, projectOwner, projectName } = urlProjectContext;
+    if (!projectId && !projectName) return;
+    const match = projects.find((p) => {
+      if (projectId) return p.id === projectId;
+      const nameOk = p.name === projectName;
+      const ownerOk = !projectOwner || p.owner_username === projectOwner;
+      return nameOk && ownerOk;
+    });
+    if (match) {
+      setSelectedProjectIds(new Set([match.id]));
+      autoSelectAppliedRef.current = true;
+    }
+  }, [metaReady, projects, urlProjectContext]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const policies = useMemo(
